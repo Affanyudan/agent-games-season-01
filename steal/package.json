@@ -1,0 +1,15 @@
+{
+  "name": "a5yfam-steal-the-vfy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A5YFAM Steal the VFY agent for zkVerify Agent Games Season 01",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "snarkjs": "0.7.6",
+    "circomlibjs": "^0.1.7"
+  }
+}
