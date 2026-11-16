@@ -20,6 +20,17 @@
 //  14  circuit refuses to prove APPROVE on trap inputs (direct fullProve, decision=1)
 //  15  preflight -> {ok:true, protocolVersion:"v1"} + signed response
 //  16  GET /health -> ok:true, hmacConfigured:true, selfTest PASS
+//  --- unified endpoint (dashboard sends BOTH tracks to /gatekeeper) ---
+//  17  Steal EXTRACT via POST /gatekeeper (matchId routing) -> six VFY
+//      fields, correct types, proof verifies against vfy-policy vk, signed
+//  18  Steal FORTIFY via POST /gatekeeper (type routing) -> amount omitted,
+//      proof verifies
+//  19  Steal HOLD via POST /agent -> amount omitted, proof verifies
+//  20  Steal replay same (matchId, turn) -> byte-identical response
+//  21  Steal commitment mismatch -> HOLD, no proof (200, fail-closed)
+//  22  Gatekeeper task after Steal turns -> still APPROVE + proof verifies
+//  23  GET /health -> both tracks, steal commitment == Poseidon(params, salt)
+//  24  GET / -> lists both tracks + POST /gatekeeper and POST /agent
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
@@ -33,6 +44,13 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const TEST_SECRET = 'test-secret-local-only-do-not-use-live';
 const VK = '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0';
 const RECIP = '0x1111111111111111111111111111111111111111';
+// Steal params/salt for the unified process under test. The real salt may
+// be passed in via STEAL_STRATEGY_SALT (env only, never written to a file);
+// otherwise the TEST-ONLY salt is used and the commitment check (23) just
+// verifies Poseidon(params, salt) for that salt.
+const STEAL_SALT = (process.env.STEAL_STRATEGY_SALT ||
+  '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef').replace(/^0x/, '');
+const STEAL_PARAMS = process.env.STEAL_STRATEGY_PARAMS || '5,50,0,0,0,0,0,0';
 
 function sign(body) {
   return crypto.createHmac('sha256', TEST_SECRET).update(body).digest('hex');
@@ -72,6 +90,57 @@ function baseTask(overrides = {}) {
   };
 }
 
+// Steal turn envelope (same shape as steal/test.js). `extra` lets a test
+// add a `type` field to exercise type-based routing.
+function stealEnvelope(matchId, turn, self, opp, commitment, nonce, extra = {}) {
+  return {
+    protocolVersion: 'v1',
+    eventId: 'steal-the-vfy',
+    mode: 'competition',
+    matchId,
+    turn,
+    issuedAt: new Date().toISOString(),
+    deadlineAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    state: {
+      selfBalance: String(self),
+      opponentBalance: String(opp),
+      selfFortifiedUntilTurn: null,
+      opponentFortifiedUntilTurn: null,
+    },
+    strategyCommitment: { hash: commitment },
+    resolverVersion: 'v1',
+    nonce,
+    ...extra,
+  };
+}
+
+async function postPath(urlPath, obj, { badSig = false } = {}) {
+  const body = JSON.stringify(obj);
+  const res = await fetch(`${BASE}${urlPath}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-agent-games-signature': badSig ? 'deadbeef' : sign(body),
+    },
+    body,
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* non-JSON */ }
+  return { status: res.status, text, json, respSig: res.headers.get('x-agent-games-signature') };
+}
+
+// The six fields the VFY protocol schema requires on a Steal turn response.
+function hasSixVfyFields(b) {
+  return !!b
+    && typeof b.matchId === 'string'
+    && typeof b.turn === 'number'
+    && typeof b.action === 'object' && b.action !== null
+    && typeof b.policyProof === 'object' && b.policyProof !== null
+    && typeof b.agentTimestamp === 'string'
+    && typeof b.idempotencyKey === 'string';
+}
+
 const results = [];
 function check(name, pass, detail = '') {
   results.push({ name, pass, detail });
@@ -97,6 +166,8 @@ async function waitForHealth(tries = 40) {
       PORT: String(PORT),
       HOST: '127.0.0.1',
       AGENT_GAMES_HMAC_SECRET: TEST_SECRET,
+      STEAL_STRATEGY_SALT: STEAL_SALT,
+      STEAL_STRATEGY_PARAMS: STEAL_PARAMS,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -106,8 +177,8 @@ async function waitForHealth(tries = 40) {
 
   try {
     const health0 = await waitForHealth();
-    // Let the startup self-test finish (it runs async after listen).
-    for (let i = 0; i < 40 && !serverLog.includes('self-test gatekeeper'); i++) {
+    // Let both startup self-tests finish (they run async after listen).
+    for (let i = 0; i < 80 && (!serverLog.includes('self-test gatekeeper') || !serverLog.includes('self-test steal')); i++) {
       await new Promise((r) => setTimeout(r, 250));
     }
 
@@ -262,6 +333,103 @@ async function waitForHealth(tries = 40) {
     const proveMs = Date.now() - t2;
     const directOk = await snarkjs.groth16.verify(vk, publicSignals, proof);
     console.log(`INFO  direct fullProve (valid input): ${proveMs}ms, verifies=${directOk}, signals=${publicSignals.length}`);
+
+    // ---- unified endpoint: Steal the VFY turns via POST /gatekeeper ----
+    // The dashboard sends both tracks' tasks to this single endpoint, so a
+    // Steal turn must be answered here with all six VFY fields. The match
+    // id below is the one from the real failed practice (2026-11-16 18:13
+    // WIB), replayed locally against the unified server.
+    const stealVk = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'circuits', 'vfy-policy_vk.json'), 'utf8'));
+    const health1 = await (await fetch(`${BASE}/health`)).json();
+    const stealCommitment = health1.steal && health1.steal.commitment;
+    const { buildPoseidon } = require(path.join(__dirname, '..', 'steal', 'node_modules', 'circomlibjs'));
+    const poseidon = await buildPoseidon();
+    const P = (arr) => poseidon.F.toString(poseidon(arr.map((x) => BigInt(x))));
+    const paramsArr = STEAL_PARAMS.split(',').map((s) => BigInt(s.trim()));
+    const expectedCommitment = '0x' + BigInt(P([...paramsArr, BigInt('0x' + STEAL_SALT)])).toString(16).padStart(64, '0');
+    const MID_U = '638ce8fe-f11f-466e-906d-2ac10ecc73f9';
+
+    // 17. Steal EXTRACT via POST /gatekeeper, matchId-only routing (the
+    // envelope as documented has no `type` field).
+    const env17 = stealEnvelope(MID_U, 1, 95, 105, stealCommitment, 'unified-nonce-17');
+    const r17 = await postPath('/gatekeeper', env17);
+    let v17 = false;
+    if (r17.status === 200 && r17.json && r17.json.policyProof) {
+      v17 = await snarkjs.groth16.verify(stealVk, r17.json.policyProof.public_signals, r17.json.policyProof.proof);
+    }
+    check('17 Steal EXTRACT via POST /gatekeeper (matchId routing): six VFY fields + proof verifies + signed',
+      r17.status === 200 && hasSixVfyFields(r17.json)
+      && r17.json.action.type === 'EXTRACT' && r17.json.action.amount === 5 && v17
+      && r17.respSig === sign(r17.text),
+      `status=${r17.status} action=${JSON.stringify(r17.json && r17.json.action)} verify=${v17} signed=${r17.respSig === sign(r17.text)}`);
+
+    // 18. Steal FORTIFY via POST /gatekeeper, type-based routing.
+    const env18 = stealEnvelope(MID_U, 2, 40, 105, stealCommitment, 'unified-nonce-18', { type: 'agent-games.steal-the-vfy.v1' });
+    const r18 = await postPath('/gatekeeper', env18);
+    let v18 = false;
+    if (r18.status === 200 && r18.json && r18.json.policyProof) {
+      v18 = await snarkjs.groth16.verify(stealVk, r18.json.policyProof.public_signals, r18.json.policyProof.proof);
+    }
+    check('18 Steal FORTIFY via POST /gatekeeper (type routing): amount omitted + proof verifies',
+      r18.status === 200 && hasSixVfyFields(r18.json)
+      && r18.json.action.type === 'FORTIFY' && !('amount' in r18.json.action) && v18,
+      `action=${JSON.stringify(r18.json && r18.json.action)} verify=${v18}`);
+
+    // 19. Steal HOLD via POST /agent (self 95, opp 0 -> HOLD).
+    const env19 = stealEnvelope(MID_U, 3, 95, 0, stealCommitment, 'unified-nonce-19');
+    const r19 = await postPath('/agent', env19);
+    let v19 = false;
+    if (r19.status === 200 && r19.json && r19.json.policyProof) {
+      v19 = await snarkjs.groth16.verify(stealVk, r19.json.policyProof.public_signals, r19.json.policyProof.proof);
+    }
+    check('19 Steal HOLD via POST /agent: amount omitted + proof verifies',
+      r19.status === 200 && hasSixVfyFields(r19.json)
+      && r19.json.action.type === 'HOLD' && !('amount' in r19.json.action) && v19,
+      `action=${JSON.stringify(r19.json && r19.json.action)} verify=${v19}`);
+
+    // 20. Steal replay same (matchId, turn) -> byte-identical.
+    const r20 = await postPath('/gatekeeper', env17);
+    check('20 Steal replay same (matchId, turn) -> byte-identical',
+      r20.status === 200 && r20.text === r17.text, `identical=${r20.text === r17.text}`);
+
+    // 21. Steal commitment mismatch -> HOLD, no proof (200, fail-closed).
+    // NOTE: a HOLD with no policyProof will not pass the platform's strict
+    // schema validation either, but this is the guide's fail-closed shape
+    // (live: resolved as HOLD, -2); this check only asserts parity with
+    // the standalone Steal server.
+    const env21 = stealEnvelope(MID_U, 4, 95, 105, '0x' + '00'.repeat(32), 'unified-nonce-21');
+    const r21 = await postPath('/gatekeeper', env21);
+    check('21 Steal commitment mismatch -> HOLD, no proof',
+      r21.status === 200 && r21.json && r21.json.action.type === 'HOLD' && !r21.json.policyProof
+      && r21.json.reason === 'COMMITMENT_MISMATCH',
+      `reason=${r21.json && r21.json.reason}`);
+
+    // 22. Gatekeeper task after Steal turns -> still APPROVE + proof verifies.
+    const r22 = await postGatekeeper(baseTask({ task_id: 'gk_test_after_steal', proof_tx: '0xbbb2' }));
+    let v22 = false;
+    if (r22.json && r22.json.proof && r22.json.public_signals) {
+      v22 = await snarkjs.groth16.verify(vk, r22.json.public_signals, r22.json.proof);
+    }
+    check('22 Gatekeeper task after Steal turns -> APPROVE + proof verifies',
+      r22.status === 200 && r22.json.decision === 'APPROVE' && v22,
+      `decision=${r22.json && r22.json.decision} verify=${v22}`);
+
+    // 23. /health reports both tracks; steal commitment == Poseidon(params, salt).
+    check('23 /health reports both tracks, steal commitment == Poseidon(params, salt)',
+      health1.ok === true && Array.isArray(health1.tracks)
+      && health1.tracks.includes('proof-gatekeeper') && health1.tracks.includes('steal-the-vfy')
+      && String(stealCommitment).toLowerCase() === expectedCommitment
+      && String(health1.steal.selfTest).startsWith('PASS'),
+      `commitment=${String(stealCommitment).slice(0, 18)}… expected=${expectedCommitment.slice(0, 18)}… stealSelfTest=${health1.steal.selfTest}`);
+
+    // 24. GET / lists both tracks + POST /gatekeeper and POST /agent.
+    const rootRes = await fetch(`${BASE}/`);
+    const rootJson = await rootRes.json();
+    check('24 GET / lists both tracks + /gatekeeper and /agent',
+      rootRes.status === 200 && Array.isArray(rootJson.tracks)
+      && rootJson.tracks.includes('steal-the-vfy')
+      && rootJson.endpoints.includes('POST /gatekeeper') && rootJson.endpoints.includes('POST /agent'),
+      `tracks=${JSON.stringify(rootJson.tracks)} endpoints=${JSON.stringify(rootJson.endpoints)}`);
 
     // Self-test line from server log.
     const selfTestLine = (serverLog.match(/self-test gatekeeper: .*/) || ['(not in log yet)'])[0];

@@ -334,11 +334,18 @@ structure was used as a cross-check.
     tuning them is Andan's call; any change needs a new commitment
     registered before the next pairing. The live salt must be a stable
     host secret (generate with `openssl rand -hex 32`), never the test salt.
-11. **Hosting must run BOTH servers.** Gatekeeper on 8787, Steal on 8788.
-    The root `Dockerfile` currently runs only `gatekeeper/server.js`;
-    deployment needs both processes (second container / second start
-    command) behind the public HTTPS endpoint, with the dashboard
-    registering the full handler path for each track.
+11. **Hosting — UNIFIED endpoint (fixed 2026-11-16).** The dashboard
+    registers ONE endpoint per agent and sends BOTH tracks' tasks to it,
+    so the Gatekeeper process (`gatekeeper/server.js`, root `Dockerfile`,
+    port 8787) also serves Steal turns: it routes envelopes by shape
+    (`matchId` / `eventId: 'steal-the-vfy'` / type containing 'steal' ->
+    `steal/server.js`'s `handleSteal`; everything else -> Gatekeeper).
+    The root `Dockerfile` installs the Steal deps too (circomlibjs) and
+    copies `steal/server.js` + `steal/keccak.js`. The standalone Steal
+    service (`Dockerfile.steal`, port 8788) still runs independently.
+    The Gatekeeper app needs env `STEAL_STRATEGY_SALT` (real salt) and
+    `STEAL_STRATEGY_PARAMS=5,50,0,0,0,0,0,0` or its Steal commitment
+    will not match the registered one.
 12. **Practice turns (both tracks).** After deploy, run unscored practice
     turns first and confirm the platform accepts the proofs. For Steal
     this also settles: (a) the `matchId` → field mapping (raw hex is the

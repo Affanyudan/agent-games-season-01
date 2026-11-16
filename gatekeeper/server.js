@@ -4,9 +4,17 @@
 // Protocol (from the official Builder Field Guide, agentgames.zkverify.io/build,
 // and /api/circuit-info; cross-checked against two independent public
 // reference builds that ran the same circuit locally):
-//   POST /gatekeeper — signed JSON task envelope. Verify the HMAC-SHA256
-//     signature in header `x-agent-games-signature` over the RAW body BEFORE
-//     parsing anything. Bad signature -> 401, no work done.
+//   POST /gatekeeper (and POST /agent) — signed JSON task envelope. Verify
+//     the HMAC-SHA256 signature in header `x-agent-games-signature` over
+//     the RAW body BEFORE parsing anything. Bad signature -> 401.
+//   UNIFIED ENDPOINT: the dashboard registers ONE endpoint per agent and
+//     sends BOTH tracks' tasks here. Envelopes are routed by shape, after
+//     HMAC verification and preflight handling: a Steal turn envelope
+//     (string `matchId`, `eventId: 'steal-the-vfy'`, or a type containing
+//     'steal') is delegated to steal/server.js's handleSteal; everything
+//     else goes to the Gatekeeper handler. Steal responses carry all six
+//     VFY fields (matchId, turn, action, policyProof, agentTimestamp,
+//     idempotencyKey) and are signed the same way.
 //   Preflight {"type":"agent-games.preflight.v1"} -> {ok:true, protocolVersion:"v1"}.
 //   Task fields (inside `input` or top-level): registered_vk, proof_vk,
 //     minimum, public_balance, expiry_block, current_block, recipient,
@@ -44,6 +52,12 @@
 //     How the string task_id maps to a circuit field element. The keccak
 //     default is UNCONFIRMED against the platform: if a practice task's
 //     proof is rejected, switch the mode and retry (no other code changes).
+//   STEAL_STRATEGY_SALT — hex (32 bytes), the Steal strategy salt. The
+//     unified process needs it because it also serves Steal turns; without
+//     it the TEST-ONLY default salt is used and the commitment will not
+//     match the one registered in the dashboard.
+//   STEAL_STRATEGY_PARAMS — comma-separated 8 ints, default
+//     "5,50,0,0,0,0,0,0". Must match the registered commitment.
 
 const http = require('http');
 const crypto = require('crypto');
@@ -51,6 +65,12 @@ const fs = require('fs');
 const path = require('path');
 const snarkjs = require('snarkjs');
 const { keccak256ModP, FIELD_PRIME } = require('./keccak');
+// Unified endpoint: the dashboard registers ONE endpoint per agent and
+// sends BOTH tracks' tasks to it, so this process also serves Steal the
+// VFY turns (steal/server.js required as a module; its own standalone
+// server on :8788 keeps running independently). Routing is by envelope
+// shape, after HMAC verification and preflight handling (see below).
+const steal = require('../steal/server.js');
 
 const AGENT_NAME = 'A5YFAM';
 const PORT = Number(process.env.PORT || 8787);
@@ -274,13 +294,19 @@ async function selfTest() {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
+      const stealStatus = steal.getStealStatus();
       return sendJson(res, 200, {
         ok: true,
         agent: AGENT_NAME,
         track: 'proof-gatekeeper',
+        tracks: ['proof-gatekeeper', 'steal-the-vfy'],
         hmacConfigured: !!HMAC_SECRET,
         taskIdMode: TASK_ID_MODE,
         selfTest: gatekeeperSelfTest,
+        steal: {
+          commitment: stealStatus.commitment,
+          selfTest: stealStatus.selfTest,
+        },
         uptimeSec: Math.floor(process.uptime()),
       });
     }
@@ -289,12 +315,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         service: 'agent-games',
         agent: AGENT_NAME,
-        tracks: ['proof-gatekeeper'],
-        endpoints: ['POST /gatekeeper', 'GET /health'],
+        tracks: ['proof-gatekeeper', 'steal-the-vfy'],
+        endpoints: ['POST /gatekeeper', 'POST /agent', 'GET /health'],
       });
     }
 
-    if (req.method !== 'POST' || req.url !== '/gatekeeper') {
+    if (req.method !== 'POST' || (req.url !== '/gatekeeper' && req.url !== '/agent')) {
       return sendJson(res, 404, { error: 'not found' });
     }
 
@@ -321,7 +347,25 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, protocolVersion: 'v1' }, true);
     }
 
-    const result = await handleGatekeeper(obj);
+    // Route by envelope shape. The dashboard has ONE registered endpoint
+    // per agent and sends both tracks' tasks here: a Steal turn envelope
+    // carries `matchId` (and usually `eventId: 'steal-the-vfy'` or a type
+    // containing 'steal'); a Gatekeeper task carries `task_id` (and a type
+    // containing 'gatekeeper'). Anything else falls through to the
+    // Gatekeeper handler, exactly as before (INVALID_TASK on bad input).
+    const typeStr = typeof obj.type === 'string' ? obj.type : '';
+    const isSteal = typeStr.includes('steal')
+      || obj.eventId === 'steal-the-vfy'
+      || typeof obj.matchId === 'string';
+    let result;
+    if (isSteal) {
+      if (obj.eventId && obj.eventId !== 'steal-the-vfy') {
+        return sendJson(res, 400, { error: 'invalid_event' });
+      }
+      result = await steal.handleSteal(obj);
+    } else {
+      result = await handleGatekeeper(obj);
+    }
     if (result.cached) return sendCached(res, result.cached);
     return sendJson(res, result.status, result.body, true);
   } catch (e) {
@@ -336,6 +380,17 @@ server.listen(PORT, HOST, async () => {
   console.log(`[server] taskIdMode: ${TASK_ID_MODE}`);
   await selfTest();
   console.log(`[server] self-test gatekeeper: ${gatekeeperSelfTest}`);
+  // Warm up the Steal handler (Poseidon, commitment, self-test) so its
+  // first turn does not pay the init cost. Failures here must not take
+  // the Gatekeeper down: handleSteal re-awaits init per turn.
+  try {
+    await steal.ensureReady();
+    const st = steal.getStealStatus();
+    console.log(`[server] self-test steal: ${st.selfTest}`);
+    console.log(`[server] steal commitment: ${st.commitment}`);
+  } catch (e) {
+    console.error('[server] steal init failed:', e.message);
+  }
 });
 
 module.exports = { server, decide, taskIdToField };

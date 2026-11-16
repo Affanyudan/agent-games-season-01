@@ -300,7 +300,33 @@ function isNonNegInt(v) {
   return false;
 }
 
+// ---- lazy init (also used when this module is required by the unified
+// gatekeeper process, where main() never runs) ----
+let readyPromise = null;
+async function ensureReady() {
+  if (!readyPromise) {
+    readyPromise = (async () => {
+      poseidon = await buildPoseidon();
+      COMMITMENT = computeCommitment(STRATEGY_PARAMS, SALT);
+      await selfTest();
+    })();
+  }
+  return readyPromise;
+}
+
+function getStealStatus() {
+  return {
+    commitment: COMMITMENT === null
+      ? null
+      : '0x' + BigInt(COMMITMENT).toString(16).padStart(64, '0'),
+    selfTest: stealSelfTest,
+  };
+}
+
 async function handleSteal(envelope) {
+  // When required as a module (unified process), main() never runs, so
+  // initialise poseidon / COMMITMENT / self-test lazily on first use.
+  await ensureReady();
   const matchId = String(envelope.matchId || '');
   const turn = envelope.turn;
   const cacheKey = `${matchId}:${turn}`;
@@ -481,8 +507,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function main() {
-  poseidon = await buildPoseidon();
-  COMMITMENT = computeCommitment(STRATEGY_PARAMS, SALT);
+  await ensureReady();
   console.log(`[server] ${AGENT_NAME} steal-the-vfy starting (port ${PORT})`);
   console.log(`[server] HMAC secret: ${HMAC_SECRET ? 'configured' : 'NOT SET (inbound verification disabled)'}`);
   console.log(`[server] strategy params: [${STRATEGY_PARAMS.join(', ')}]`);
@@ -490,9 +515,8 @@ async function main() {
   if (SALT_HEX === TEST_SALT_HEX) {
     console.log('[server] WARNING: using the TEST-ONLY salt. Set STEAL_STRATEGY_SALT before going live.');
   }
-  server.listen(PORT, HOST, async () => {
+  server.listen(PORT, HOST, () => {
     console.log(`[server] listening on ${HOST}:${PORT}`);
-    await selfTest();
     console.log(`[server] self-test steal: ${stealSelfTest}`);
   });
 }
@@ -511,4 +535,7 @@ module.exports = {
   matchIdToField,
   publicInputsHash,
   ACTION_CODE,
+  handleSteal,
+  ensureReady,
+  getStealStatus,
 };
