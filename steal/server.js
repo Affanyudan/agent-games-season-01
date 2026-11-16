@@ -14,10 +14,19 @@
 //            opponentFortifiedUntilTurn},
 //     strategyCommitment:{hash}, resolverVersion, nonce}.
 //     The commitment is accepted in several shapes (the platform's live
-//     envelope does not always use strategyCommitment:{hash}): a bare
-//     string, {hash} with or without the 0x prefix (case-insensitive),
-//     envelope.commitment (string or {hash}), or
-//     envelope.strategyCommitmentHash. See envelopeCommitment().
+//     envelope does not always use strategyCommitment:{hash} — the 18:42
+//     and 19:05 practice runs failed closed with COMMITMENT_MISMATCH even
+//     though the server's commitment is correct): a bare string, {hash}
+//     with or without the 0x prefix (case-insensitive),
+//     envelope.commitment (string or {hash}), envelope.strategyCommitmentHash,
+//     strategyCommitment as an object with any of the keys hash /
+//     commitment / value / digest, a decimal-digit string of the field
+//     element, or the commitment nested anywhere in the envelope (the
+//     whole envelope is scanned recursively for it). See
+//     envelopeCommitment() / scanEnvelopeCommitment(). On a genuine
+//     mismatch the server logs a [diag] line with the envelope's top-level
+//     keys and a string-truncated copy of the body, so the shape can be
+//     diagnosed from live logs.
 //   5-minute turn deadline (the platform waits ~30 s per push).
 //   Response: {matchId, turn, action:{type, amount?},
 //     policyProof:{circuitVersion:"v1", proof, public_signals,
@@ -356,26 +365,102 @@ function getStealStatus() {
 }
 
 // Normalise a commitment value to 64 lowercase hex chars (no 0x prefix),
-// or '' when it is not a commitment. Accepts a bare string or {hash};
-// the hex may carry an optional 0x prefix and any case.
+// or '' when it is not a commitment. Accepts:
+//   - a bare string holding a 64-hex value with an optional 0x prefix
+//     (any case);
+//   - an object holding that string under any of the keys hash,
+//     commitment, value, digest;
+//   - a decimal-digit string (the field element as a plain integer) —
+//     only when it has at least 20 digits, so ordinary small numbers
+//     (balances, turns) are never mistaken for one. The hex form wins
+//     when a value is ambiguous (a 64-char digit-only string is read as
+//     hex, not decimal).
 function normaliseCommitment(value) {
   let s = '';
-  if (typeof value === 'string') s = value;
-  else if (value && typeof value === 'object' && typeof value.hash === 'string') s = value.hash;
-  else return '';
-  s = s.trim().toLowerCase().replace(/^0x/, '');
-  return /^[0-9a-f]{64}$/.test(s) ? s : '';
+  if (typeof value === 'string') {
+    s = value.trim();
+  } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const k of ['hash', 'commitment', 'value', 'digest']) {
+      if (typeof value[k] === 'string') { s = value[k].trim(); break; }
+    }
+    if (!s) return '';
+  } else {
+    return '';
+  }
+  const hex = s.toLowerCase().replace(/^0x/, '');
+  if (/^[0-9a-f]{64}$/.test(hex)) return hex;
+  if (/^\d{20,}$/.test(s)) {
+    try {
+      const h = BigInt(s).toString(16).padStart(64, '0');
+      if (/^[0-9a-f]{64}$/.test(h)) return h;
+    } catch { /* not a number */ }
+  }
+  return '';
 }
 
-// Extract the envelope's frozen commitment, tolerating the shapes the
-// platform actually sends: strategyCommitment:{hash} (guide),
-// strategyCommitment as a bare string, envelope.commitment (string or
-// {hash}), or envelope.strategyCommitmentHash (string). First non-empty
-// normalised value wins.
+// Extract the envelope's frozen commitment from the known locations
+// (fast paths): strategyCommitment:{hash} (guide), strategyCommitment
+// as a bare string, envelope.commitment (string or {hash}), or
+// envelope.strategyCommitmentHash (string). First non-empty normalised
+// value wins. The recursive scan below is the fallback for shapes not
+// listed here.
 function envelopeCommitment(envelope) {
   return normaliseCommitment(envelope.strategyCommitment)
     || normaliseCommitment(envelope.commitment)
     || normaliseCommitment(envelope.strategyCommitmentHash);
+}
+
+// Recursively walk the whole envelope and look for our commitment, so
+// the frozen commitment is found wherever the platform nests it (top
+// level, input, state, match, ...). Returns { matched, firstCandidate }:
+// matched is true when any string (or commitment-shaped object) anywhere
+// in the envelope normalises to ourHex; firstCandidate is the first
+// normalised value found anywhere (for the mismatch warning). Only
+// values that normalise to a 64-hex commitment count as candidates —
+// balances, turns, nonces, timestamps and matchIds never do (see
+// normaliseCommitment). Depth-capped; cycles guarded (defensive —
+// parsed JSON has none).
+function scanEnvelopeCommitment(node, ourHex) {
+  const out = { matched: false, firstCandidate: '' };
+  const seen = new Set();
+  const visit = (v, depth) => {
+    if (out.matched || v === null || v === undefined || depth > 20) return;
+    if (typeof v === 'string' || (typeof v === 'object' && !Array.isArray(v))) {
+      const c = normaliseCommitment(v);
+      if (c) {
+        if (!out.firstCandidate) out.firstCandidate = c;
+        if (c === ourHex) { out.matched = true; return; }
+      }
+    }
+    if (typeof v === 'object') {
+      if (seen.has(v)) return;
+      seen.add(v);
+      const children = Array.isArray(v) ? v : Object.values(v);
+      for (const child of children) visit(child, depth + 1);
+    }
+  };
+  visit(node, 0);
+  return out;
+}
+
+// Deep-copy a JSON value with every string truncated to its first 40
+// characters, for the mismatch diagnostic log: the envelope shape stays
+// visible without printing long values in full. Depth-capped.
+function truncateStrings(value, depth = 0) {
+  if (typeof value === 'string') {
+    return value.length > 40 ? value.slice(0, 40) + '…' : value;
+  }
+  if (Array.isArray(value)) {
+    if (depth > 20) return ['…'];
+    return value.map((v) => truncateStrings(v, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    if (depth > 20) return { '…': '…' };
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = truncateStrings(v, depth + 1);
+    return out;
+  }
+  return value;
 }
 
 async function handleSteal(envelope) {
@@ -412,12 +497,30 @@ async function handleSteal(envelope) {
   }
 
   // The envelope's frozen commitment must match ours, or no valid proof
-  // can be produced (circuit line 72). Fail closed to HOLD, no proof.
+  // can be produced (circuit line 72). Fast paths first, then a
+  // shape-agnostic recursive scan of the whole envelope (the live
+  // platform envelope's commitment was not found at any fixed path in
+  // the 18:42 and 19:05 practice runs). Fail closed to HOLD, no proof.
   const ourHash = '0x' + BigInt(COMMITMENT).toString(16).padStart(64, '0');
   const ourHex = ourHash.slice(2).toLowerCase();
   const envHex = envelopeCommitment(envelope);
-  if (!envHex || envHex !== ourHex) {
-    console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', envHex ? envHex.slice(0, 18) + '…' : '(missing)', ourHash);
+  let matched = !!(envHex && envHex === ourHex);
+  let scan = null;
+  if (!matched) {
+    scan = scanEnvelopeCommitment(envelope, ourHex);
+    matched = scan.matched;
+  }
+  if (!matched) {
+    const shown = envHex || (scan && scan.firstCandidate);
+    console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', shown ? shown.slice(0, 18) + '…' : '(missing)', ourHash);
+    // Diagnostic: the envelope shape, so a future mismatch can be
+    // diagnosed from live logs (blitz.cloud keeps no log history, and a
+    // failed practice shows no sanitised request). Strings are truncated
+    // to 40 chars; the envelope is the platform's task payload and
+    // contains no secrets (the HMAC signature is a header, not the body).
+    console.warn('[diag] steal envelope keys=[%s] body=%s',
+      Object.keys(envelope).join(','),
+      JSON.stringify(truncateStrings(envelope)));
     const r = holdResponse(matchId, turn, 'COMMITMENT_MISMATCH');
     responseCache.set(cacheKey, { status: r.status, body: JSON.stringify(r.body) });
     return r;
@@ -592,4 +695,8 @@ module.exports = {
   handleSteal,
   ensureReady,
   getStealStatus,
+  normaliseCommitment,
+  envelopeCommitment,
+  scanEnvelopeCommitment,
+  truncateStrings,
 };

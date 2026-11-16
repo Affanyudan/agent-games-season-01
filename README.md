@@ -165,9 +165,19 @@ push). Swiss stage 13–17 Nov, 7 rounds → Top 16 knockout.
   opponentBalance, selfFortifiedUntilTurn, opponentFortifiedUntilTurn}`,
   `strategyCommitment:{hash}`, `deadlineAt`, `nonce`. The commitment is
   accepted in several shapes (the platform's live envelope does not
-  always use `strategyCommitment:{hash}`): a bare string, `{hash}` with
-  or without the `0x` prefix (case-insensitive), `envelope.commitment`
-  (string or `{hash}`), or `envelope.strategyCommitmentHash`.
+  always use `strategyCommitment:{hash}` — the 18:42 and 19:05 practice
+  runs failed closed with COMMITMENT_MISMATCH at every fixed path even
+  though the server's commitment is correct): a bare string, `{hash}`
+  with or without the `0x` prefix (case-insensitive),
+  `envelope.commitment` (string or `{hash}`),
+  `envelope.strategyCommitmentHash`, `strategyCommitment` as an object
+  with any of the keys `hash` / `commitment` / `value` / `digest`, a
+  decimal-digit string of the field element, or the commitment nested
+  anywhere in the envelope — the whole envelope is scanned recursively
+  for it. On a genuine mismatch the server logs a `[diag]` line with the
+  envelope's top-level keys and a string-truncated copy of the body, so
+  the shape can be diagnosed from live logs (blitz.cloud keeps no log
+  history and a failed practice shows no sanitised request).
 - Response: `{matchId, turn, action:{type, amount?},
   policyProof:{circuitVersion:"v1", proof, public_signals,
   publicInputsHash}, agentTimestamp, idempotencyKey}`. `action.amount` is

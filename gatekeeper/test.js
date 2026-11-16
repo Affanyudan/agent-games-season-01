@@ -37,6 +37,19 @@
 //  27  Steal HOLD, envelope.commitment as a bare string -> proof verifies
 //  28  Re-run of the failed 18:42 practice (fresh matchId) -> six VFY
 //      fields, idempotencyKey a valid UUID, stable across replay
+//  --- recursive envelope scan (the 19:05 practice still failed closed
+//      with COMMITMENT_MISMATCH at every fixed path) ---
+//  29  Steal EXTRACT, commitment nested under input as
+//      {strategyCommitment:{hash}} -> proof verifies
+//  30  Steal FORTIFY, commitment nested under input as a bare string ->
+//      proof verifies
+//  31  Steal EXTRACT, commitment as a decimal string -> proof verifies
+//  32  Steal HOLD, strategyCommitment:{commitment} -> proof verifies
+//  33  Re-run of the failed 19:05 practice (fresh matchId, turn 1,
+//      commitment nested under input) -> six VFY fields + UUID stable
+//      on replay
+//  34  Wrong commitment as a decimal string -> HOLD, no proof
+//  35  Mismatch diagnostic log line prints envelope keys + truncated body
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
@@ -514,6 +527,101 @@ async function waitForHealth(tries = 40) {
       && r28b.status === 200 && r28b.text === r28a.text
       && r28b.json.idempotencyKey === r28a.json.idempotencyKey,
       `idempotencyKey=${r28a.json && r28a.json.idempotencyKey} verify=${v28} replayIdentical=${r28b.text === r28a.text}`);
+
+    // ---- Recursive envelope scan (the 19:05 practice still failed ----
+    // ---- closed with COMMITMENT_MISMATCH at every fixed path) ----
+    const MID_SCAN = 'e5f6a7b8-58cc-4372-a567-0e02b2c3d479';
+    const commitmentDec = BigInt(stealCommitment).toString(); // decimal form
+    async function verifySteal(r) {
+      if (r.status !== 200 || !r.json || !r.json.policyProof) return false;
+      return snarkjs.groth16.verify(stealVk, r.json.policyProof.public_signals, r.json.policyProof.proof);
+    }
+
+    // 29. Commitment nested under input as {strategyCommitment:{hash}}
+    // -> EXTRACT, six VFY fields, proof verifies, UUID idempotencyKey.
+    const env29 = stealEnvelope(MID_SCAN, 1, 95, 105, stealCommitment, 'scan-nonce-29');
+    delete env29.strategyCommitment;
+    env29.input = { strategyCommitment: { hash: stealCommitment } };
+    const r29 = await postPath('/gatekeeper', env29);
+    const v29 = await verifySteal(r29);
+    check('29 Steal EXTRACT, commitment nested under input as {strategyCommitment:{hash}} -> six VFY fields + proof verifies + UUID idempotencyKey',
+      r29.status === 200 && hasSixVfyFields(r29.json)
+      && r29.json.action.type === 'EXTRACT' && r29.json.action.amount === 5 && v29
+      && UUID_RE.test(r29.json.idempotencyKey),
+      `action=${JSON.stringify(r29.json && r29.json.action)} verify=${v29} idempotencyKey=${r29.json && r29.json.idempotencyKey}`);
+
+    // 30. Commitment nested under input as a bare string -> FORTIFY,
+    // proof verifies, UUID idempotencyKey.
+    const env30 = stealEnvelope(MID_SCAN, 2, 40, 105, stealCommitment, 'scan-nonce-30');
+    delete env30.strategyCommitment;
+    env30.input = { strategyCommitment: stealCommitment };
+    const r30 = await postPath('/gatekeeper', env30);
+    const v30 = await verifySteal(r30);
+    check('30 Steal FORTIFY, commitment nested under input as bare string -> proof verifies + UUID idempotencyKey',
+      r30.status === 200 && hasSixVfyFields(r30.json)
+      && r30.json.action.type === 'FORTIFY' && !('amount' in r30.json.action) && v30
+      && UUID_RE.test(r30.json.idempotencyKey),
+      `action=${JSON.stringify(r30.json && r30.json.action)} verify=${v30} idempotencyKey=${r30.json && r30.json.idempotencyKey}`);
+
+    // 31. Commitment as a decimal string (top-level strategyCommitment)
+    // -> EXTRACT, proof verifies, UUID idempotencyKey.
+    const env31 = stealEnvelope(MID_SCAN, 3, 95, 105, stealCommitment, 'scan-nonce-31',
+      { strategyCommitment: commitmentDec });
+    const r31 = await postPath('/gatekeeper', env31);
+    const v31 = await verifySteal(r31);
+    check('31 Steal EXTRACT, commitment as decimal string -> proof verifies + UUID idempotencyKey',
+      r31.status === 200 && hasSixVfyFields(r31.json)
+      && r31.json.action.type === 'EXTRACT' && v31
+      && UUID_RE.test(r31.json.idempotencyKey),
+      `action=${JSON.stringify(r31.json && r31.json.action)} verify=${v31} idempotencyKey=${r31.json && r31.json.idempotencyKey}`);
+
+    // 32. strategyCommitment as an object with a .commitment key ->
+    // HOLD, proof verifies, UUID idempotencyKey.
+    const env32 = stealEnvelope(MID_SCAN, 4, 95, 0, stealCommitment, 'scan-nonce-32',
+      { strategyCommitment: { commitment: stealCommitment } });
+    const r32 = await postPath('/gatekeeper', env32);
+    const v32 = await verifySteal(r32);
+    check('32 Steal HOLD, strategyCommitment:{commitment} -> proof verifies + UUID idempotencyKey',
+      r32.status === 200 && hasSixVfyFields(r32.json)
+      && r32.json.action.type === 'HOLD' && !('amount' in r32.json.action) && v32
+      && UUID_RE.test(r32.json.idempotencyKey),
+      `action=${JSON.stringify(r32.json && r32.json.action)} verify=${v32} idempotencyKey=${r32.json && r32.json.idempotencyKey}`);
+
+    // 33. Re-run of the failed 19:05 practice (match 9ca729bc-… turn 1
+    // shape) with a fresh matchId and the commitment nested under input
+    // -> six VFY fields, proof verifies, UUID stable on replay.
+    const MID_1905 = 'f6a7b8c9-3347-454a-b5f4-cdce1e67fb28';
+    const env33 = stealEnvelope(MID_1905, 1, 95, 105, stealCommitment, 'scan-nonce-33');
+    delete env33.strategyCommitment;
+    env33.input = { strategyCommitment: { hash: stealCommitment } };
+    const r33a = await postPath('/gatekeeper', env33);
+    const r33b = await postPath('/gatekeeper', env33);
+    check('33 Re-run of failed 19:05 practice (fresh matchId, turn 1, commitment nested under input) -> six VFY fields + proof verifies + UUID stable on replay',
+      r33a.status === 200 && hasSixVfyFields(r33a.json)
+      && r33a.json.action.type === 'EXTRACT' && await verifySteal(r33a)
+      && UUID_RE.test(r33a.json.idempotencyKey)
+      && r33b.status === 200 && r33b.text === r33a.text
+      && r33b.json.idempotencyKey === r33a.json.idempotencyKey,
+      `idempotencyKey=${r33a.json && r33a.json.idempotencyKey} replayIdentical=${r33b.text === r33a.text}`);
+
+    // 34. Wrong commitment as a decimal string (of a different value)
+    // -> HOLD, no proof, COMMITMENT_MISMATCH.
+    const wrongDec = (BigInt(stealCommitment) + 1n).toString();
+    const env34 = stealEnvelope(MID_SCAN, 5, 95, 105, stealCommitment, 'scan-nonce-34',
+      { strategyCommitment: wrongDec });
+    const r34 = await postPath('/gatekeeper', env34);
+    check('34 Wrong commitment as decimal string -> HOLD, no proof, COMMITMENT_MISMATCH',
+      r34.status === 200 && r34.json && r34.json.action.type === 'HOLD' && !r34.json.policyProof
+      && r34.json.reason === 'COMMITMENT_MISMATCH'
+      && typeof r34.json.idempotencyKey === 'string' && UUID_RE.test(r34.json.idempotencyKey),
+      `reason=${r34.json && r34.json.reason} idempotencyKey=${r34.json && r34.json.idempotencyKey}`);
+
+    // 35. Mismatch diagnostic log line prints envelope keys + truncated
+    // body (from the mismatch turns in checks 21 and 34).
+    const diagCount = (serverLog.match(/\[diag\] steal envelope keys=/g) || []).length;
+    check('35 Mismatch diagnostic log line prints envelope keys + truncated body',
+      diagCount >= 2 && serverLog.includes('strategyCommitment') && serverLog.includes('matchId'),
+      `diagLines=${diagCount}`);
 
     // Self-test line from server log.
     const selfTestLine = (serverLog.match(/self-test gatekeeper: .*/) || ['(not in log yet)'])[0];

@@ -77,10 +77,14 @@ function startServer(port, params) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  child.stdout.on('data', (d) => process.stdout.write(`[srv:${port}] ${d}`));
-  child.stderr.on('data', (d) => process.stderr.write(`[srv:${port}:err] ${d}`));
+  child.stdout.on('data', (d) => { serverLogs.push(d.toString()); process.stdout.write(`[srv:${port}] ${d}`); });
+  child.stderr.on('data', (d) => { serverLogs.push(d.toString()); process.stderr.write(`[srv:${port}:err] ${d}`); });
   return child;
 }
+
+// All stdout/stderr from both test servers, for asserting on log lines
+// (e.g. the [diag] mismatch diagnostic).
+const serverLogs = [];
 
 async function waitHealthy(port, timeoutMs = 30000) {
   const t0 = Date.now();
@@ -352,6 +356,93 @@ function resolveTurn(self, opp, ourAction, ourAmount, oppAction, oppAmount) {
       && UUID_RE.test(r23a.body.idempotencyKey)
       && r23b.body.idempotencyKey === r23a.body.idempotencyKey,
       `idempotencyKey=${r23a.body && r23a.body.idempotencyKey} replayIdentical=${r23a.text === r23b.text}`);
+
+    // ---- 19:05 practice fix: recursive envelope scan for the commitment ----
+    // The 19:05 re-run still failed closed with COMMITMENT_MISMATCH even
+    // though the server's commitment is correct and the idempotencyKey
+    // UUID fix worked — the live envelope's commitment sits at no fixed
+    // path the parser knew. The server now scans the WHOLE envelope
+    // recursively for the commitment (hex with/without 0x, decimal
+    // string, {hash|commitment|value|digest} object, nested anywhere).
+    const MID_S = 'a1b2c3d4-58cc-4372-a567-0e02b2c3d479';
+    const commitmentDec = BigInt(commitmentA).toString(); // decimal form
+
+    // 24: commitment nested under input as {strategyCommitment:{hash}}.
+    let env24 = envelope(MID_S, 1, 95, 105, commitmentA, 'scan-nonce-24');
+    delete env24.strategyCommitment;
+    env24.input = { strategyCommitment: { hash: commitmentA } };
+    r = await post(8790, '/steal', env24, TEST_SECRET);
+    check('24 commitment nested under input as {strategyCommitment:{hash}} -> EXTRACT + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 25: commitment nested under input as a bare string.
+    let env25 = envelope(MID_S, 2, 40, 105, commitmentA, 'scan-nonce-25');
+    delete env25.strategyCommitment;
+    env25.input = { strategyCommitment: commitmentA };
+    r = await post(8790, '/steal', env25, TEST_SECRET);
+    check('25 commitment nested under input as bare string -> FORTIFY + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'FORTIFY'
+      && !('amount' in r.body.action) && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 26: commitment as a decimal string (top-level strategyCommitment).
+    let env26 = envelope(MID_S, 3, 95, 105, commitmentA, 'scan-nonce-26');
+    env26.strategyCommitment = commitmentDec;
+    r = await post(8790, '/steal', env26, TEST_SECRET);
+    check('26 commitment as decimal string -> EXTRACT + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 27: strategyCommitment as an object with a .commitment key.
+    let env27 = envelope(MID_S, 4, 95, 0, commitmentA, 'scan-nonce-27');
+    env27.strategyCommitment = { commitment: commitmentA };
+    r = await post(8790, '/steal', env27, TEST_SECRET);
+    check('27 strategyCommitment:{commitment} -> HOLD + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'HOLD'
+      && !('amount' in r.body.action) && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 28: re-run of the failed 19:05 practice (match 9ca729bc-… turn 1
+    // shape) with a fresh matchId and the commitment nested under input
+    // -> six VFY fields, proof verifies, UUID stable on replay.
+    const MID_T = 'd4e5f6a7-58cc-4372-a567-0e02b2c3d479';
+    let env28 = envelope(MID_T, 1, 95, 105, commitmentA, 'scan-nonce-28');
+    delete env28.strategyCommitment;
+    env28.input = { strategyCommitment: { hash: commitmentA } };
+    const r28a = await post(8790, '/steal', env28, TEST_SECRET);
+    const r28b = await post(8790, '/steal', env28, TEST_SECRET);
+    check('28 re-run of failed 19:05 practice (fresh matchId, commitment nested under input) -> six VFY fields + proof verifies + UUID stable on replay',
+      r28a.status === 200 && hasSixVfyFields(r28a.body) && r28a.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r28a.body) && UUID_RE.test(r28a.body.idempotencyKey)
+      && r28b.status === 200 && r28b.text === r28a.text,
+      `idempotencyKey=${r28a.body && r28a.body.idempotencyKey} replayIdentical=${r28b.text === r28a.text}`);
+
+    // 29: genuinely wrong commitment — a different hex AND a decimal
+    // string of a different value -> HOLD, no proof, COMMITMENT_MISMATCH.
+    const wrongHex = '0x' + '11'.repeat(32);
+    const wrongDec = (BigInt(commitmentA) + 1n).toString();
+    let env29a = envelope(MID_S, 5, 95, 105, commitmentA, 'scan-nonce-29a');
+    env29a.strategyCommitment = wrongHex;
+    const r29a = await post(8790, '/steal', env29a, TEST_SECRET);
+    let env29b = envelope(MID_S, 6, 95, 105, commitmentA, 'scan-nonce-29b');
+    env29b.strategyCommitment = wrongDec;
+    const r29b = await post(8790, '/steal', env29b, TEST_SECRET);
+    check('29 wrong commitment (different hex; decimal of a different value) -> HOLD, no proof, COMMITMENT_MISMATCH',
+      r29a.status === 200 && r29a.body && r29a.body.action.type === 'HOLD' && !r29a.body.policyProof && r29a.body.reason === 'COMMITMENT_MISMATCH'
+      && r29b.status === 200 && r29b.body && r29b.body.action.type === 'HOLD' && !r29b.body.policyProof && r29b.body.reason === 'COMMITMENT_MISMATCH',
+      `hexReason=${r29a.body && r29a.body.reason} decReason=${r29b.body && r29b.body.reason}`);
+
+    // 30: the mismatch diagnostic log line prints the envelope's
+    // top-level keys and a truncated copy of the body (from the mismatch
+    // turns in checks 14 and 29).
+    const logs = serverLogs.join('');
+    check('30 mismatch diagnostic log line prints envelope keys + truncated body',
+      logs.includes('[diag] steal envelope keys=') && logs.includes('strategyCommitment') && logs.includes('matchId')
+      && (logs.match(/\[diag\] steal envelope keys=/g) || []).length >= 2,
+      `diagLines=${(logs.match(/\[diag\] steal envelope keys=/g) || []).length}`);
   } finally {
     srvA.kill();
     srvB.kill();
