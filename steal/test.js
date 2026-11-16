@@ -443,6 +443,71 @@ function resolveTurn(self, opp, ourAction, ourAmount, oppAction, oppAmount) {
       logs.includes('[diag] steal envelope keys=') && logs.includes('strategyCommitment') && logs.includes('matchId')
       && (logs.match(/\[diag\] steal envelope keys=/g) || []).length >= 2,
       `diagLines=${(logs.match(/\[diag\] steal envelope keys=/g) || []).length}`);
+
+    // ---- 19:21 practice fix: left-pad short hex commitments ----
+    // The 19:21 re-run still failed closed with COMMITMENT_MISMATCH even
+    // though the recursive scanner (check 24–28) finds the commitment in
+    // every nested shape — because normaliseCommitment required EXACTLY
+    // 64 hex chars. Our commitment starts "0e": rendered by
+    // BigInt.toString(16) it arrives as 63 chars "edb7d80…" and was
+    // rejected. Short hex is now left-padded to 64 (extra leading zeros
+    // are stripped first); digit-only strings keep the decimal path.
+    const commitment63 = commitmentA.replace(/^0x0/, ''); // 63 chars, "edb7d80…"
+    const wrongHex63 = (BigInt(commitmentA) + 1n).toString(16); // 63 chars, "…431bf"
+
+    // 31: 63-char hex (leading zero nibble dropped) as {hash} -> EXTRACT.
+    let env31 = envelope(MID_S, 7, 95, 105, commitmentA, 'pad-nonce-31');
+    env31.strategyCommitment = { hash: commitment63 };
+    r = await post(8790, '/steal', env31, TEST_SECRET);
+    check('31 commitment as 63-char hex (leading zero dropped) -> EXTRACT + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 32: hex with extra leading zeros ("0x000edb7d80…") -> FORTIFY.
+    let env32 = envelope(MID_S, 8, 40, 105, commitmentA, 'pad-nonce-32');
+    env32.strategyCommitment = { hash: '0x000' + commitment63 };
+    r = await post(8790, '/steal', env32, TEST_SECRET);
+    check('32 commitment hex with extra leading zeros -> FORTIFY + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'FORTIFY'
+      && !('amount' in r.body.action) && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 33: re-run of the failed 19:21 practice (match 1948b2bd-… turn 1
+    // shape) with a fresh matchId and the commitment as 63-char hex
+    // nested under input -> six VFY fields, proof verifies, UUID stable.
+    const MID_U = 'e7f8a9b0-33a9-45ba-8fc3-45a3d2225a93';
+    let env33 = envelope(MID_U, 1, 95, 105, commitmentA, 'pad-nonce-33');
+    delete env33.strategyCommitment;
+    env33.input = { strategyCommitment: { hash: commitment63 } };
+    const r33a = await post(8790, '/steal', env33, TEST_SECRET);
+    const r33b = await post(8790, '/steal', env33, TEST_SECRET);
+    check('33 re-run of failed 19:21 practice (fresh matchId, 63-char hex nested under input) -> six VFY fields + proof verifies + UUID stable on replay',
+      r33a.status === 200 && hasSixVfyFields(r33a.body) && r33a.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r33a.body) && UUID_RE.test(r33a.body.idempotencyKey)
+      && r33b.status === 200 && r33b.text === r33a.text,
+      `idempotencyKey=${r33a.body && r33a.body.idempotencyKey} replayIdentical=${r33b.text === r33a.text}`);
+
+    // 34: genuinely wrong commitment as a 63-char hex of a different
+    // value -> HOLD, no proof, COMMITMENT_MISMATCH.
+    let env34 = envelope(MID_S, 9, 95, 105, commitmentA, 'pad-nonce-34');
+    env34.strategyCommitment = { hash: wrongHex63 };
+    const r34 = await post(8790, '/steal', env34, TEST_SECRET);
+    check('34 wrong commitment as 63-char hex of a different value -> HOLD, no proof, COMMITMENT_MISMATCH',
+      r34.status === 200 && r34.body && r34.body.action.type === 'HOLD' && !r34.body.policyProof && r34.body.reason === 'COMMITMENT_MISMATCH',
+      `reason=${r34.body && r34.body.reason}`);
+
+    // 35: an envelope with NO commitment anywhere -> HOLD, no proof, and
+    // the mismatch diagnostic says explicitly that no candidate was
+    // found (distinguishing "absent" from "different").
+    let env35 = envelope(MID_S, 10, 95, 105, commitmentA, 'pad-nonce-35');
+    delete env35.strategyCommitment;
+    const r35 = await post(8790, '/steal', env35, TEST_SECRET);
+    const logs35 = serverLogs.join('');
+    check('35 envelope with no commitment at all -> HOLD, no proof + [diag] NO commitment candidate line',
+      r35.status === 200 && r35.body && r35.body.action.type === 'HOLD' && !r35.body.policyProof && r35.body.reason === 'COMMITMENT_MISMATCH'
+      && logs35.includes('[diag] steal envelope: NO commitment candidate found in envelope'),
+      `reason=${r35.body && r35.body.reason} noCandidateLine=${logs35.includes('[diag] steal envelope: NO commitment candidate found in envelope')}`);
   } finally {
     srvA.kill();
     srvB.kill();

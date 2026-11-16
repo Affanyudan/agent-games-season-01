@@ -50,6 +50,20 @@
 //      on replay
 //  34  Wrong commitment as a decimal string -> HOLD, no proof
 //  35  Mismatch diagnostic log line prints envelope keys + truncated body
+//  --- left-pad short hex commitments (the 19:21 practice still failed
+//      closed with COMMITMENT_MISMATCH: the commitment rendered by
+//      BigInt.toString(16) drops its leading zero nibble, arriving as
+//      63 chars "edb7d80…" instead of 64) ---
+//  36  Steal EXTRACT, commitment as 63-char hex -> proof verifies
+//  37  Steal FORTIFY, commitment hex with extra leading zeros -> proof
+//      verifies
+//  38  Re-run of the failed 19:21 practice (fresh matchId, turn 1,
+//      63-char hex nested under input) -> six VFY fields + UUID stable
+//      on replay
+//  39  Wrong commitment as 63-char hex of a different value -> HOLD,
+//      no proof
+//  40  Envelope with no commitment at all -> HOLD, no proof + [diag]
+//      NO commitment candidate line
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
@@ -622,6 +636,78 @@ async function waitForHealth(tries = 40) {
     check('35 Mismatch diagnostic log line prints envelope keys + truncated body',
       diagCount >= 2 && serverLog.includes('strategyCommitment') && serverLog.includes('matchId'),
       `diagLines=${diagCount}`);
+
+    // ---- Left-pad short hex commitments (the 19:21 practice still ----
+    // ---- failed closed with COMMITMENT_MISMATCH) ----
+    // normaliseCommitment required EXACTLY 64 hex chars, but a field
+    // element rendered by BigInt.toString(16) drops leading zero nibbles:
+    // our commitment starts "0e", so it arrives as 63 chars "edb7d80…".
+    // Short hex is now left-padded to 64 (extra leading zeros stripped
+    // first); digit-only strings keep the decimal path.
+    const commitment63 = String(stealCommitment).replace(/^0x0/, ''); // 63 chars, "edb7d80…"
+    const wrongHex63 = (BigInt(stealCommitment) + 1n).toString(16); // 63 chars, "…431bf"
+
+    // 36. 63-char hex (leading zero nibble dropped) as {hash} -> EXTRACT.
+    const env36 = stealEnvelope(MID_SCAN, 6, 95, 105, stealCommitment, 'pad-nonce-36',
+      { strategyCommitment: { hash: commitment63 } });
+    const r36 = await postPath('/gatekeeper', env36);
+    const v36 = await verifySteal(r36);
+    check('36 Steal EXTRACT, commitment as 63-char hex (leading zero dropped) -> proof verifies + UUID idempotencyKey',
+      r36.status === 200 && hasSixVfyFields(r36.json)
+      && r36.json.action.type === 'EXTRACT' && r36.json.action.amount === 5 && v36
+      && UUID_RE.test(r36.json.idempotencyKey),
+      `action=${JSON.stringify(r36.json && r36.json.action)} verify=${v36} idempotencyKey=${r36.json && r36.json.idempotencyKey}`);
+
+    // 37. Hex with extra leading zeros ("0x000edb7d80…") -> FORTIFY.
+    const env37 = stealEnvelope(MID_SCAN, 7, 40, 105, stealCommitment, 'pad-nonce-37',
+      { strategyCommitment: { hash: '0x000' + commitment63 } });
+    const r37 = await postPath('/gatekeeper', env37);
+    const v37 = await verifySteal(r37);
+    check('37 Steal FORTIFY, commitment hex with extra leading zeros -> proof verifies + UUID idempotencyKey',
+      r37.status === 200 && hasSixVfyFields(r37.json)
+      && r37.json.action.type === 'FORTIFY' && !('amount' in r37.json.action) && v37
+      && UUID_RE.test(r37.json.idempotencyKey),
+      `action=${JSON.stringify(r37.json && r37.json.action)} verify=${v37} idempotencyKey=${r37.json && r37.json.idempotencyKey}`);
+
+    // 38. Re-run of the failed 19:21 practice (match 1948b2bd-… turn 1
+    // shape) with a fresh matchId and the commitment as 63-char hex
+    // nested under input -> six VFY fields, proof verifies, UUID stable.
+    const MID_1921 = 'c9d0e1f2-33a9-45ba-8fc3-45a3d2225a93';
+    const env38 = stealEnvelope(MID_1921, 1, 95, 105, stealCommitment, 'pad-nonce-38');
+    delete env38.strategyCommitment;
+    env38.input = { strategyCommitment: { hash: commitment63 } };
+    const r38a = await postPath('/gatekeeper', env38);
+    const r38b = await postPath('/gatekeeper', env38);
+    check('38 Re-run of failed 19:21 practice (fresh matchId, 63-char hex nested under input) -> six VFY fields + proof verifies + UUID stable on replay',
+      r38a.status === 200 && hasSixVfyFields(r38a.json)
+      && r38a.json.action.type === 'EXTRACT' && await verifySteal(r38a)
+      && UUID_RE.test(r38a.json.idempotencyKey)
+      && r38b.status === 200 && r38b.text === r38a.text
+      && r38b.json.idempotencyKey === r38a.json.idempotencyKey,
+      `idempotencyKey=${r38a.json && r38a.json.idempotencyKey} replayIdentical=${r38b.text === r38a.text}`);
+
+    // 39. Wrong commitment as a 63-char hex of a different value ->
+    // HOLD, no proof, COMMITMENT_MISMATCH.
+    const env39 = stealEnvelope(MID_SCAN, 8, 95, 105, stealCommitment, 'pad-nonce-39',
+      { strategyCommitment: { hash: wrongHex63 } });
+    const r39 = await postPath('/gatekeeper', env39);
+    check('39 Wrong commitment as 63-char hex of a different value -> HOLD, no proof, COMMITMENT_MISMATCH',
+      r39.status === 200 && r39.json && r39.json.action.type === 'HOLD' && !r39.json.policyProof
+      && r39.json.reason === 'COMMITMENT_MISMATCH'
+      && typeof r39.json.idempotencyKey === 'string' && UUID_RE.test(r39.json.idempotencyKey),
+      `reason=${r39.json && r39.json.reason} idempotencyKey=${r39.json && r39.json.idempotencyKey}`);
+
+    // 40. An envelope with NO commitment anywhere -> HOLD, no proof, and
+    // the mismatch diagnostic says explicitly that no candidate was
+    // found (distinguishing "absent" from "different").
+    const env40 = stealEnvelope(MID_SCAN, 9, 95, 105, stealCommitment, 'pad-nonce-40');
+    delete env40.strategyCommitment;
+    const r40 = await postPath('/gatekeeper', env40);
+    check('40 Envelope with no commitment at all -> HOLD, no proof + [diag] NO commitment candidate line',
+      r40.status === 200 && r40.json && r40.json.action.type === 'HOLD' && !r40.json.policyProof
+      && r40.json.reason === 'COMMITMENT_MISMATCH'
+      && serverLog.includes('[diag] steal envelope: NO commitment candidate found in envelope'),
+      `reason=${r40.json && r40.json.reason} noCandidateLine=${serverLog.includes('[diag] steal envelope: NO commitment candidate found in envelope')}`);
 
     // Self-test line from server log.
     const selfTestLine = (serverLog.match(/self-test gatekeeper: .*/) || ['(not in log yet)'])[0];

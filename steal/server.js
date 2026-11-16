@@ -14,19 +14,22 @@
 //            opponentFortifiedUntilTurn},
 //     strategyCommitment:{hash}, resolverVersion, nonce}.
 //     The commitment is accepted in several shapes (the platform's live
-//     envelope does not always use strategyCommitment:{hash} — the 18:42
-//     and 19:05 practice runs failed closed with COMMITMENT_MISMATCH even
-//     though the server's commitment is correct): a bare string, {hash}
-//     with or without the 0x prefix (case-insensitive),
-//     envelope.commitment (string or {hash}), envelope.strategyCommitmentHash,
-//     strategyCommitment as an object with any of the keys hash /
-//     commitment / value / digest, a decimal-digit string of the field
-//     element, or the commitment nested anywhere in the envelope (the
-//     whole envelope is scanned recursively for it). See
-//     envelopeCommitment() / scanEnvelopeCommitment(). On a genuine
-//     mismatch the server logs a [diag] line with the envelope's top-level
-//     keys and a string-truncated copy of the body, so the shape can be
-//     diagnosed from live logs.
+//     envelope does not always use strategyCommitment:{hash} — the 18:42,
+//     19:05 and 19:21 practice runs failed closed with COMMITMENT_MISMATCH
+//     even though the server's commitment is correct): a bare string,
+//     {hash} with or without the 0x prefix (case-insensitive), a hex
+//     value with leading zero nibbles dropped (e.g. 63 chars "edb7d80…"
+//     from BigInt.toString(16) — left-padded back to 64) or with extra
+//     leading zeros, envelope.commitment (string or {hash}),
+//     envelope.strategyCommitmentHash, strategyCommitment as an object
+//     with any of the keys hash / commitment / value / digest, a
+//     decimal-digit string of the field element, or the commitment
+//     nested anywhere in the envelope (the whole envelope is scanned
+//     recursively for it). See envelopeCommitment() /
+//     scanEnvelopeCommitment(). On a genuine mismatch the server logs a
+//     [diag] line with the envelope's top-level keys and a
+//     string-truncated copy of the body, so the shape can be diagnosed
+//     from live logs.
 //   5-minute turn deadline (the platform waits ~30 s per push).
 //   Response: {matchId, turn, action:{type, amount?},
 //     policyProof:{circuitVersion:"v1", proof, public_signals,
@@ -366,15 +369,20 @@ function getStealStatus() {
 
 // Normalise a commitment value to 64 lowercase hex chars (no 0x prefix),
 // or '' when it is not a commitment. Accepts:
-//   - a bare string holding a 64-hex value with an optional 0x prefix
-//     (any case);
+//   - a bare string holding a hex value with an optional 0x prefix
+//     (any case), 1–64 chars, left-padded with zeros to 64 — a field
+//     element rendered by BigInt.toString(16) drops leading zero nibbles
+//     (our commitment starts "0e", so it arrives as 63 chars "edb7d80…");
+//     a value longer than 64 chars is accepted only when it is extra
+//     leading zeros (stripped, then padded to 64);
 //   - an object holding that string under any of the keys hash,
 //     commitment, value, digest;
 //   - a decimal-digit string (the field element as a plain integer) —
 //     only when it has at least 20 digits, so ordinary small numbers
 //     (balances, turns) are never mistaken for one. The hex form wins
 //     when a value is ambiguous (a 64-char digit-only string is read as
-//     hex, not decimal).
+//     hex, not decimal); a digit-only string shorter than 64 chars stays
+//     on the decimal path unless it contains a hex letter a–f.
 function normaliseCommitment(value) {
   let s = '';
   if (typeof value === 'string') {
@@ -387,8 +395,41 @@ function normaliseCommitment(value) {
   } else {
     return '';
   }
-  const hex = s.toLowerCase().replace(/^0x/, '');
-  if (/^[0-9a-f]{64}$/.test(hex)) return hex;
+  const raw = s.toLowerCase().replace(/^0x/, '');
+  if (/^[0-9a-f]+$/.test(raw)) {
+    let hex = raw;
+    if (hex.length > 64) {
+      // Longer than 64 nibbles: either extra leading zeros (strip them
+      // and continue) or — when the string is all digits — a decimal
+      // field element (up to ~77 digits for a 254-bit value), which
+      // takes the decimal path below. A longer string containing a–f
+      // is neither: reject it.
+      const stripped = hex.replace(/^0+/, '');
+      if (stripped.length <= 64) {
+        hex = stripped;
+      } else if (/^\d+$/.test(raw)) {
+        try {
+          const h = BigInt(raw).toString(16).padStart(64, '0');
+          if (/^[0-9a-f]{64}$/.test(h)) return h;
+        } catch { /* not a number */ }
+        return '';
+      } else {
+        return '';
+      }
+    }
+    if (hex.length === 0) return '';
+    if (hex.length === 64) return hex;
+    if (/[a-f]/.test(hex)) return hex.padStart(64, '0');
+    // All digits, shorter than 64 chars: a decimal field element
+    // (existing precedence), unless too short to be one.
+    if (hex.length < 20) return '';
+    try {
+      const h = BigInt(hex).toString(16).padStart(64, '0');
+      if (/^[0-9a-f]{64}$/.test(h)) return h;
+    } catch { /* not a number */ }
+    return '';
+  }
+  // Not hex at all: a bare decimal-digit string (no 0x prefix).
   if (/^\d{20,}$/.test(s)) {
     try {
       const h = BigInt(s).toString(16).padStart(64, '0');
@@ -512,6 +553,12 @@ async function handleSteal(envelope) {
   }
   if (!matched) {
     const shown = envHex || (scan && scan.firstCandidate);
+    // Distinguish "absent" from "different" for the next live log
+    // capture: when no candidate was found anywhere in the envelope,
+    // say so explicitly (the [warn] below would only print "(missing)").
+    if (!shown) {
+      console.warn('[diag] steal envelope: NO commitment candidate found in envelope');
+    }
     console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', shown ? shown.slice(0, 18) + '…' : '(missing)', ourHash);
     // Diagnostic: the envelope shape, so a future mismatch can be
     // diagnosed from live logs (blitz.cloud keeps no log history, and a
