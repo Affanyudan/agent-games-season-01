@@ -1,0 +1,25 @@
+# A5YFAM Agent Games — Steal the VFY
+# Build context: the agent-games/ directory (this Dockerfile lives at its root).
+# Mirror of the root Dockerfile, but for steal/server.js (port 8788).
+# Use on any Docker host (Render / blitz.cloud / Railway / Fly.io) as a
+# second service alongside the Gatekeeper service (root Dockerfile, port 8787).
+# On blitz.cloud: pick this file under Advanced settings → Dockerfile.
+# Env vars to set on the host (never commit them):
+#   AGENT_GAMES_HMAC_SECRET=<dashboard-issued secret>
+#   STEAL_STRATEGY_PARAMS=5,50,0,0,0,0,0,0
+#   STEAL_STRATEGY_SALT=<salt in ~/workspace/tools/agent-games-secrets/steal-salt.txt>
+#   HOST=0.0.0.0  PORT=8788
+FROM node:20-slim
+WORKDIR /app
+
+# Install production deps only (snarkjs 0.7.6, circomlibjs) into steal/
+COPY steal/package.json steal/package-lock.json ./steal/
+RUN cd steal && npm ci --omit=dev
+
+# Server code + official circuits (paths are relative: server.js reads ../circuits/)
+COPY steal/server.js steal/keccak.js ./steal/
+COPY circuits/ ./circuits/
+
+ENV HOST=0.0.0.0 PORT=8788
+EXPOSE 8788
+CMD ["node", "steal/server.js"]
