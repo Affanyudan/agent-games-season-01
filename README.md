@@ -163,14 +163,23 @@ push). Swiss stage 13–17 Nov, 7 rounds → Top 16 knockout.
   `{"type":"agent-games.preflight.v1"}` → `{ok:true, protocolVersion:"v1"}`, signed.
 - Turn envelope: `matchId` (UUID), `turn`, `state:{selfBalance,
   opponentBalance, selfFortifiedUntilTurn, opponentFortifiedUntilTurn}`,
-  `strategyCommitment:{hash}`, `deadlineAt`, `nonce`.
+  `strategyCommitment:{hash}`, `deadlineAt`, `nonce`. The commitment is
+  accepted in several shapes (the platform's live envelope does not
+  always use `strategyCommitment:{hash}`): a bare string, `{hash}` with
+  or without the `0x` prefix (case-insensitive), `envelope.commitment`
+  (string or `{hash}`), or `envelope.strategyCommitmentHash`.
 - Response: `{matchId, turn, action:{type, amount?},
   policyProof:{circuitVersion:"v1", proof, public_signals,
   publicInputsHash}, agentTimestamp, idempotencyKey}`. `action.amount` is
   OMITTED for HOLD/FORTIFY (the schema rejects it even as 0). Proof and
-  public signals sit INSIDE `policyProof`. Retries of the same
-  `(matchId, turn)` return the byte-identical cached response; a reused
-  nonce under a different turn → 400.
+  public signals sit INSIDE `policyProof`. `idempotencyKey` is a
+  deterministic UUIDv5 (nil-UUID namespace) of the internal cache key
+  `"matchId:turn"` — the platform schema requires a UUID. Retries of the
+  same `(matchId, turn)` return the byte-identical cached response; a
+  reused nonce under a different turn → 400. A genuine commitment
+  mismatch still fails closed to HOLD with NO policyProof: the strict
+  practice schema rejects that response (policyProof is required), but
+  live play resolves it as HOLD, −2, per the guide.
 - `publicInputsHash`: keccak256 of 8 ABI-packed 32-byte big-endian fields
   (commitment, matchId dashes removed, turn, selfBalance, opponentBalance,
   action enum HOLD 0 / FORTIFY 1 / EXTRACT 2, amount, circuitVersion 1) —

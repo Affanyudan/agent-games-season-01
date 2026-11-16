@@ -22,6 +22,20 @@ function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}`);
 }
 
+// UUIDv5 (RFC 4122): 8-4-4-4-12 hex, version nibble 5, variant 10xx.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// All six fields the VFY protocol schema requires on a Steal turn response.
+function hasSixVfyFields(b) {
+  return !!b
+    && typeof b.matchId === 'string'
+    && typeof b.turn === 'number'
+    && typeof b.action === 'object' && b.action !== null
+    && typeof b.policyProof === 'object' && b.policyProof !== null
+    && typeof b.agentTimestamp === 'string'
+    && typeof b.idempotencyKey === 'string';
+}
+
 function hmac(secret, rawBody) {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 }
@@ -223,11 +237,14 @@ function resolveTurn(self, opp, ourAction, ourAmount, oppAction, oppAmount) {
     const r13b = await post(8790, '/steal', env13, TEST_SECRET);
     check('13 replay same turn -> byte-identical', r13a.text === r13b.text, `identical=${r13a.text === r13b.text}`);
 
-    // 14: commitment mismatch -> HOLD with no proof (200).
+    // 14: commitment mismatch -> HOLD with no proof (200). The HOLD
+    // response still carries a valid-UUID idempotencyKey (the platform
+    // schema requires it on every response).
     r = await post(8790, '/steal', envelope(MID_A, 7, 95, 105, '0x' + '00'.repeat(32), 'test-nonce-14'), TEST_SECRET);
     check('14 commitment mismatch -> HOLD, no proof',
-      r.status === 200 && r.body && r.body.action.type === 'HOLD' && !r.body.policyProof,
-      `reason=${r.body && r.body.reason}`);
+      r.status === 200 && r.body && r.body.action.type === 'HOLD' && !r.body.policyProof
+      && typeof r.body.idempotencyKey === 'string' && UUID_RE.test(r.body.idempotencyKey),
+      `reason=${r.body && r.body.reason} idempotencyKey=${r.body && r.body.idempotencyKey}`);
 
     // 15: nonce reuse across different turns -> 400.
     const env15a = envelope('aaaaaaaa-0000-0000-0000-000000000000', 1, 100, 100, commitmentA, 'shared-nonce');
@@ -288,6 +305,53 @@ function resolveTurn(self, opp, ourAction, ourAmount, oppAction, oppAmount) {
 
     // 19: proof-generation time (max turn round trip measured in check 18).
     check('19 max turn round trip is far inside the 5-minute deadline', maxMs < 30000, `max ${maxMs}ms vs 300000ms deadline, ~30s platform push wait`);
+
+    // ---- 18:42 practice fixes: UUID idempotencyKey + tolerant commitment ----
+    const MID_F = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    async function verifyStealTurn(body) {
+      if (!body || !body.policyProof) return false;
+      return snarkjs.groth16.verify(VK, body.policyProof.public_signals, body.policyProof.proof);
+    }
+
+    // 20: commitment as a bare string -> 200, six VFY fields, proof
+    // verifies, idempotencyKey a valid UUID.
+    let env20 = envelope(MID_F, 1, 95, 105, commitmentA, 'fix-nonce-20');
+    env20.strategyCommitment = commitmentA;
+    r = await post(8790, '/steal', env20, TEST_SECRET);
+    check('20 commitment bare string -> six VFY fields + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'EXTRACT'
+      && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 21: commitment hash without 0x -> FORTIFY, proof verifies.
+    let env21 = envelope(MID_F, 2, 40, 105, commitmentA, 'fix-nonce-21');
+    env21.strategyCommitment = { hash: commitmentA.replace(/^0x/, '') };
+    r = await post(8790, '/steal', env21, TEST_SECRET);
+    check('21 commitment hash without 0x -> FORTIFY + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'FORTIFY'
+      && !('amount' in r.body.action) && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 22: envelope.commitment as a bare string (no strategyCommitment
+    // field) -> HOLD, proof verifies.
+    let env22 = envelope(MID_F, 3, 95, 0, commitmentA, 'fix-nonce-22');
+    delete env22.strategyCommitment;
+    env22.commitment = commitmentA;
+    r = await post(8790, '/steal', env22, TEST_SECRET);
+    check('22 envelope.commitment bare string -> HOLD + proof verifies + UUID idempotencyKey',
+      r.status === 200 && hasSixVfyFields(r.body) && r.body.action.type === 'HOLD'
+      && !('amount' in r.body.action) && await verifyStealTurn(r.body) && UUID_RE.test(r.body.idempotencyKey),
+      `action=${JSON.stringify(r.body && r.body.action)} idempotencyKey=${r.body && r.body.idempotencyKey}`);
+
+    // 23: idempotencyKey is a valid UUID and identical on replay of the
+    // same turn (replay of check 20's envelope).
+    const r23a = await post(8790, '/steal', env20, TEST_SECRET);
+    const r23b = await post(8790, '/steal', env20, TEST_SECRET);
+    check('23 idempotencyKey UUID + stable across replay',
+      r23a.status === 200 && r23b.status === 200 && r23a.text === r23b.text
+      && UUID_RE.test(r23a.body.idempotencyKey)
+      && r23b.body.idempotencyKey === r23a.body.idempotencyKey,
+      `idempotencyKey=${r23a.body && r23a.body.idempotencyKey} replayIdentical=${r23a.text === r23b.text}`);
   } finally {
     srvA.kill();
     srvB.kill();

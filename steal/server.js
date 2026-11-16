@@ -13,11 +13,19 @@
 //     state:{selfBalance, opponentBalance, selfFortifiedUntilTurn,
 //            opponentFortifiedUntilTurn},
 //     strategyCommitment:{hash}, resolverVersion, nonce}.
+//     The commitment is accepted in several shapes (the platform's live
+//     envelope does not always use strategyCommitment:{hash}): a bare
+//     string, {hash} with or without the 0x prefix (case-insensitive),
+//     envelope.commitment (string or {hash}), or
+//     envelope.strategyCommitmentHash. See envelopeCommitment().
 //   5-minute turn deadline (the platform waits ~30 s per push).
 //   Response: {matchId, turn, action:{type, amount?},
 //     policyProof:{circuitVersion:"v1", proof, public_signals,
 //                  proofReference?, publicInputsHash?},
 //     agentTimestamp, idempotencyKey}.
+//   idempotencyKey is a deterministic UUIDv5 (nil-UUID namespace) of the
+//   internal cache key "matchId:turn" — the platform schema requires a
+//   UUID, and the value must be stable across retries of the same turn.
 //   action.amount must be OMITTED for HOLD/FORTIFY (the schema rejects it
 //   even when it is 0). policyProof.proof and policyProof.public_signals
 //   must sit INSIDE policyProof, not at the top level.
@@ -279,6 +287,30 @@ function readBody(req) {
 const responseCache = new Map(); // "matchId:turn" -> { status, body }
 const seenNonces = new Map(); // nonce -> "matchId:turn"
 
+// ---- deterministic UUIDv5 (RFC 4122) for idempotencyKey ----
+// The platform schema requires idempotencyKey to be a UUID. Derive it
+// deterministically from the internal cache key "matchId:turn" (SHA-1 over
+// the nil-UUID namespace + the name, version/variant bits set), so the
+// value is a valid UUID, unique per (matchId, turn), and stable across
+// retries of the same turn (the responseCache already returns the
+// byte-identical body on replay). Node stdlib crypto only.
+const UUID_NAMESPACE_NIL = Buffer.alloc(16); // 00000000-0000-0000-0000-000000000000
+function uuidV5(name) {
+  const hash = crypto.createHash('sha1')
+    .update(UUID_NAMESPACE_NIL)
+    .update(Buffer.from(String(name), 'utf8'))
+    .digest();
+  const b = Buffer.from(hash.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50; // version 5
+  b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+  const hex = b.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function idempotencyKeyFor(matchId, turn) {
+  return uuidV5(`${matchId}:${turn}`);
+}
+
 function holdResponse(matchId, turn, reason) {
   // Fail closed: HOLD with NO policyProof (guide: resolved as HOLD, -2).
   return {
@@ -288,7 +320,7 @@ function holdResponse(matchId, turn, reason) {
       turn,
       action: { type: 'HOLD' },
       agentTimestamp: new Date().toISOString(),
-      idempotencyKey: `${matchId}:${turn}`,
+      idempotencyKey: idempotencyKeyFor(matchId, turn),
       reason,
     },
   };
@@ -321,6 +353,29 @@ function getStealStatus() {
       : '0x' + BigInt(COMMITMENT).toString(16).padStart(64, '0'),
     selfTest: stealSelfTest,
   };
+}
+
+// Normalise a commitment value to 64 lowercase hex chars (no 0x prefix),
+// or '' when it is not a commitment. Accepts a bare string or {hash};
+// the hex may carry an optional 0x prefix and any case.
+function normaliseCommitment(value) {
+  let s = '';
+  if (typeof value === 'string') s = value;
+  else if (value && typeof value === 'object' && typeof value.hash === 'string') s = value.hash;
+  else return '';
+  s = s.trim().toLowerCase().replace(/^0x/, '');
+  return /^[0-9a-f]{64}$/.test(s) ? s : '';
+}
+
+// Extract the envelope's frozen commitment, tolerating the shapes the
+// platform actually sends: strategyCommitment:{hash} (guide),
+// strategyCommitment as a bare string, envelope.commitment (string or
+// {hash}), or envelope.strategyCommitmentHash (string). First non-empty
+// normalised value wins.
+function envelopeCommitment(envelope) {
+  return normaliseCommitment(envelope.strategyCommitment)
+    || normaliseCommitment(envelope.commitment)
+    || normaliseCommitment(envelope.strategyCommitmentHash);
 }
 
 async function handleSteal(envelope) {
@@ -358,12 +413,11 @@ async function handleSteal(envelope) {
 
   // The envelope's frozen commitment must match ours, or no valid proof
   // can be produced (circuit line 72). Fail closed to HOLD, no proof.
-  const envHash = envelope.strategyCommitment && envelope.strategyCommitment.hash
-    ? String(envelope.strategyCommitment.hash).toLowerCase()
-    : '';
   const ourHash = '0x' + BigInt(COMMITMENT).toString(16).padStart(64, '0');
-  if (!envHash || envHash !== ourHash.toLowerCase()) {
-    console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', envHash || '(missing)', ourHash);
+  const ourHex = ourHash.slice(2).toLowerCase();
+  const envHex = envelopeCommitment(envelope);
+  if (!envHex || envHex !== ourHex) {
+    console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', envHex ? envHex.slice(0, 18) + '…' : '(missing)', ourHash);
     const r = holdResponse(matchId, turn, 'COMMITMENT_MISMATCH');
     responseCache.set(cacheKey, { status: r.status, body: JSON.stringify(r.body) });
     return r;
@@ -404,7 +458,7 @@ async function handleSteal(envelope) {
         ),
       },
       agentTimestamp: new Date().toISOString(),
-      idempotencyKey: cacheKey,
+      idempotencyKey: idempotencyKeyFor(matchId, turn),
     };
     responseCache.set(cacheKey, { status: 200, body: JSON.stringify(body) });
     return { status: 200, body };

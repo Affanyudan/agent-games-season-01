@@ -31,6 +31,12 @@
 //  22  Gatekeeper task after Steal turns -> still APPROVE + proof verifies
 //  23  GET /health -> both tracks, steal commitment == Poseidon(params, salt)
 //  24  GET / -> lists both tracks + POST /gatekeeper and POST /agent
+//  25  Steal EXTRACT, strategyCommitment as a bare string -> six VFY
+//      fields, proof verifies, idempotencyKey a valid UUID
+//  26  Steal FORTIFY, strategyCommitment.hash without 0x -> proof verifies
+//  27  Steal HOLD, envelope.commitment as a bare string -> proof verifies
+//  28  Re-run of the failed 18:42 practice (fresh matchId) -> six VFY
+//      fields, idempotencyKey a valid UUID, stable across replay
 
 const { spawn } = require('child_process');
 const crypto = require('crypto');
@@ -140,6 +146,9 @@ function hasSixVfyFields(b) {
     && typeof b.agentTimestamp === 'string'
     && typeof b.idempotencyKey === 'string';
 }
+
+// UUIDv5 (RFC 4122): 8-4-4-4-12 hex, version nibble 5, variant 10xx.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const results = [];
 function check(name, pass, detail = '') {
@@ -401,8 +410,9 @@ async function waitForHealth(tries = 40) {
     const r21 = await postPath('/gatekeeper', env21);
     check('21 Steal commitment mismatch -> HOLD, no proof',
       r21.status === 200 && r21.json && r21.json.action.type === 'HOLD' && !r21.json.policyProof
-      && r21.json.reason === 'COMMITMENT_MISMATCH',
-      `reason=${r21.json && r21.json.reason}`);
+      && r21.json.reason === 'COMMITMENT_MISMATCH'
+      && typeof r21.json.idempotencyKey === 'string' && UUID_RE.test(r21.json.idempotencyKey),
+      `reason=${r21.json && r21.json.reason} idempotencyKey=${r21.json && r21.json.idempotencyKey}`);
 
     // 22. Gatekeeper task after Steal turns -> still APPROVE + proof verifies.
     const r22 = await postGatekeeper(baseTask({ task_id: 'gk_test_after_steal', proof_tx: '0xbbb2' }));
@@ -430,6 +440,80 @@ async function waitForHealth(tries = 40) {
       && rootJson.tracks.includes('steal-the-vfy')
       && rootJson.endpoints.includes('POST /gatekeeper') && rootJson.endpoints.includes('POST /agent'),
       `tracks=${JSON.stringify(rootJson.tracks)} endpoints=${JSON.stringify(rootJson.endpoints)}`);
+
+    // ---- Steal fixes (2026-11-16 18:42 practice failure) ----
+    // The platform failed the re-run with two schema errors: policyProof
+    // undefined (the live envelope's commitment was not recognised, so the
+    // server failed closed to HOLD) and idempotencyKey "Invalid UUID"
+    // ("matchId:turn" is not a UUID). The response field is now a
+    // deterministic UUIDv5 of "matchId:turn", and the commitment parser
+    // accepts strategyCommitment as {hash} | bare string (with or without
+    // 0x), envelope.commitment, and envelope.strategyCommitmentHash.
+    const MID_FIX = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+
+    // 25. Variant (b): strategyCommitment as a bare string -> EXTRACT,
+    // six VFY fields, proof verifies, idempotencyKey a valid UUID.
+    const env25 = stealEnvelope(MID_FIX, 1, 95, 105, stealCommitment, 'fix-nonce-25',
+      { strategyCommitment: stealCommitment });
+    const r25 = await postPath('/gatekeeper', env25);
+    let v25 = false;
+    if (r25.status === 200 && r25.json && r25.json.policyProof) {
+      v25 = await snarkjs.groth16.verify(stealVk, r25.json.policyProof.public_signals, r25.json.policyProof.proof);
+    }
+    check('25 Steal EXTRACT, strategyCommitment bare string -> six VFY fields + proof verifies + UUID idempotencyKey',
+      r25.status === 200 && hasSixVfyFields(r25.json)
+      && r25.json.action.type === 'EXTRACT' && r25.json.action.amount === 5 && v25
+      && UUID_RE.test(r25.json.idempotencyKey),
+      `action=${JSON.stringify(r25.json && r25.json.action)} verify=${v25} idempotencyKey=${r25.json && r25.json.idempotencyKey}`);
+
+    // 26. Variant (c): strategyCommitment.hash without 0x -> FORTIFY,
+    // proof verifies, idempotencyKey a valid UUID.
+    const env26 = stealEnvelope(MID_FIX, 2, 40, 105, stealCommitment, 'fix-nonce-26',
+      { strategyCommitment: { hash: String(stealCommitment).replace(/^0x/, '') } });
+    const r26 = await postPath('/gatekeeper', env26);
+    let v26 = false;
+    if (r26.status === 200 && r26.json && r26.json.policyProof) {
+      v26 = await snarkjs.groth16.verify(stealVk, r26.json.policyProof.public_signals, r26.json.policyProof.proof);
+    }
+    check('26 Steal FORTIFY, strategyCommitment.hash without 0x -> proof verifies + UUID idempotencyKey',
+      r26.status === 200 && hasSixVfyFields(r26.json)
+      && r26.json.action.type === 'FORTIFY' && !('amount' in r26.json.action) && v26
+      && UUID_RE.test(r26.json.idempotencyKey),
+      `action=${JSON.stringify(r26.json && r26.json.action)} verify=${v26} idempotencyKey=${r26.json && r26.json.idempotencyKey}`);
+
+    // 27. Variant (d): envelope.commitment as a bare string (no
+    // strategyCommitment field at all) -> HOLD, proof verifies.
+    const env27 = stealEnvelope(MID_FIX, 3, 95, 0, stealCommitment, 'fix-nonce-27');
+    delete env27.strategyCommitment;
+    env27.commitment = stealCommitment;
+    const r27 = await postPath('/gatekeeper', env27);
+    let v27 = false;
+    if (r27.status === 200 && r27.json && r27.json.policyProof) {
+      v27 = await snarkjs.groth16.verify(stealVk, r27.json.policyProof.public_signals, r27.json.policyProof.proof);
+    }
+    check('27 Steal HOLD, envelope.commitment bare string -> proof verifies + UUID idempotencyKey',
+      r27.status === 200 && hasSixVfyFields(r27.json)
+      && r27.json.action.type === 'HOLD' && !('amount' in r27.json.action) && v27
+      && UUID_RE.test(r27.json.idempotencyKey),
+      `action=${JSON.stringify(r27.json && r27.json.action)} verify=${v27} idempotencyKey=${r27.json && r27.json.idempotencyKey}`);
+
+    // 28. Re-run of the failed 18:42 practice with a fresh matchId:
+    // standard {hash} shape, state 95/105 -> EXTRACT, six VFY fields,
+    // idempotencyKey a valid UUID and identical on replay.
+    const env28 = stealEnvelope(MID_FIX, 4, 95, 105, stealCommitment, 'fix-nonce-28');
+    const r28a = await postPath('/gatekeeper', env28);
+    const r28b = await postPath('/gatekeeper', env28);
+    let v28 = false;
+    if (r28a.status === 200 && r28a.json && r28a.json.policyProof) {
+      v28 = await snarkjs.groth16.verify(stealVk, r28a.json.policyProof.public_signals, r28a.json.policyProof.proof);
+    }
+    check('28 Re-run of failed 18:42 practice (fresh matchId) -> six VFY fields + proof verifies + UUID idempotencyKey stable on replay',
+      r28a.status === 200 && hasSixVfyFields(r28a.json)
+      && r28a.json.action.type === 'EXTRACT' && v28
+      && UUID_RE.test(r28a.json.idempotencyKey)
+      && r28b.status === 200 && r28b.text === r28a.text
+      && r28b.json.idempotencyKey === r28a.json.idempotencyKey,
+      `idempotencyKey=${r28a.json && r28a.json.idempotencyKey} verify=${v28} replayIdentical=${r28b.text === r28a.text}`);
 
     // Self-test line from server log.
     const selfTestLine = (serverLog.match(/self-test gatekeeper: .*/) || ['(not in log yet)'])[0];
