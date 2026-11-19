@@ -497,17 +497,39 @@ function resolveTurn(self, opp, ourAction, ourAmount, oppAction, oppAmount) {
       r34.status === 200 && r34.body && r34.body.action.type === 'HOLD' && !r34.body.policyProof && r34.body.reason === 'COMMITMENT_MISMATCH',
       `reason=${r34.body && r34.body.reason}`);
 
-    // 35: an envelope with NO commitment anywhere -> HOLD, no proof, and
-    // the mismatch diagnostic says explicitly that no candidate was
-    // found (distinguishing "absent" from "different").
+    // 35: an envelope with NO commitment anywhere -> fall back to our
+    // own registered commitment and produce a valid proof (live practice
+    // 19 Nov 2026: the platform envelope carries no commitment at all).
+    // A *different* commitment still fail-closes (tests 29, 34).
     let env35 = envelope(MID_S, 10, 95, 105, commitmentA, 'pad-nonce-35');
     delete env35.strategyCommitment;
     const r35 = await post(8790, '/steal', env35, TEST_SECRET);
     const logs35 = serverLogs.join('');
-    check('35 envelope with no commitment at all -> HOLD, no proof + [diag] NO commitment candidate line',
-      r35.status === 200 && r35.body && r35.body.action.type === 'HOLD' && !r35.body.policyProof && r35.body.reason === 'COMMITMENT_MISMATCH'
-      && logs35.includes('[diag] steal envelope: NO commitment candidate found in envelope'),
-      `reason=${r35.body && r35.body.reason} noCandidateLine=${logs35.includes('[diag] steal envelope: NO commitment candidate found in envelope')}`);
+    let proof35Ok = false;
+    if (r35.status === 200 && r35.body && r35.body.policyProof) {
+      proof35Ok = await snarkjs.groth16.verify(VK, r35.body.policyProof.public_signals, r35.body.policyProof.proof);
+    }
+    check('35 envelope with no commitment at all -> fall back to ours, valid proof + fallback warn line',
+      r35.status === 200 && r35.body && r35.body.policyProof && proof35Ok
+      && logs35.includes('strategyCommitment missing in envelope'),
+      `reason=${r35.body && r35.body.reason} proofOk=${proof35Ok}`);
+
+    // 36: response validation — a real success body validates clean;
+    // a body with policyProof removed, empty public_signals, or no
+    // idempotencyKey is rejected naming the bad field.
+    const { validateStealResponse } = require('./server.js');
+    const good36 = r35.body;
+    const noProof36 = { ...good36 };
+    delete noProof36.policyProof;
+    const noSignals36 = { ...good36, policyProof: { ...good36.policyProof, public_signals: [] } };
+    const noKey36 = { ...good36 };
+    delete noKey36.idempotencyKey;
+    check('36 validateStealResponse: real body passes; missing policyProof / empty public_signals / missing idempotencyKey rejected by field',
+      validateStealResponse(good36) === null
+      && validateStealResponse(noProof36) === 'policyProof'
+      && validateStealResponse(noSignals36) === 'policyProof.public_signals'
+      && validateStealResponse(noKey36) === 'idempotencyKey',
+      `good=${validateStealResponse(good36)} noProof=${validateStealResponse(noProof36)} noSignals=${validateStealResponse(noSignals36)} noKey=${validateStealResponse(noKey36)}`);
   } finally {
     srvA.kill();
     srvB.kill();

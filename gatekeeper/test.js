@@ -62,7 +62,7 @@
 //      on replay
 //  39  Wrong commitment as 63-char hex of a different value -> HOLD,
 //      no proof
-//  40  Envelope with no commitment at all -> HOLD, no proof + [diag]
+//  40  Envelope with no commitment at all -> fall back to ours, valid proof
 //      NO commitment candidate line
 
 const { spawn } = require('child_process');
@@ -697,17 +697,21 @@ async function waitForHealth(tries = 40) {
       && typeof r39.json.idempotencyKey === 'string' && UUID_RE.test(r39.json.idempotencyKey),
       `reason=${r39.json && r39.json.reason} idempotencyKey=${r39.json && r39.json.idempotencyKey}`);
 
-    // 40. An envelope with NO commitment anywhere -> HOLD, no proof, and
-    // the mismatch diagnostic says explicitly that no candidate was
-    // found (distinguishing "absent" from "different").
+    // 40. An envelope with NO commitment anywhere -> fall back to our
+    // own registered commitment and produce a valid proof (live practice
+    // 19 Nov 2026: the platform envelope carries no commitment at all).
+    // A *different* commitment still fail-closes (checks 38, 39).
     const env40 = stealEnvelope(MID_SCAN, 9, 95, 105, stealCommitment, 'pad-nonce-40');
     delete env40.strategyCommitment;
     const r40 = await postPath('/gatekeeper', env40);
-    check('40 Envelope with no commitment at all -> HOLD, no proof + [diag] NO commitment candidate line',
-      r40.status === 200 && r40.json && r40.json.action.type === 'HOLD' && !r40.json.policyProof
-      && r40.json.reason === 'COMMITMENT_MISMATCH'
-      && serverLog.includes('[diag] steal envelope: NO commitment candidate found in envelope'),
-      `reason=${r40.json && r40.json.reason} noCandidateLine=${serverLog.includes('[diag] steal envelope: NO commitment candidate found in envelope')}`);
+    let v40 = false;
+    if (r40.status === 200 && r40.json && r40.json.policyProof) {
+      v40 = await snarkjs.groth16.verify(stealVk, r40.json.policyProof.public_signals, r40.json.policyProof.proof);
+    }
+    check('40 Envelope with no commitment at all -> fall back to ours, valid proof + fallback warn line',
+      r40.status === 200 && r40.json && r40.json.policyProof && v40
+      && serverLog.includes('strategyCommitment missing in envelope'),
+      `reason=${r40.json && r40.json.reason} proofOk=${v40}`);
 
     // Self-test line from server log.
     const selfTestLine = (serverLog.match(/self-test gatekeeper: .*/) || ['(not in log yet)'])[0];

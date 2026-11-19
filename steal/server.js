@@ -29,7 +29,10 @@
 //     scanEnvelopeCommitment(). On a genuine mismatch the server logs a
 //     [diag] line with the envelope's top-level keys and a
 //     string-truncated copy of the body, so the shape can be diagnosed
-//     from live logs.
+//     from live logs. Live practice 19 Nov 2026: the envelope carries NO
+//     commitment at all (envelope (missing)) — in that case the server
+//     falls back to its own registered commitment and proves; only a
+//     *different* candidate fail-closes to HOLD.
 //   5-minute turn deadline (the platform waits ~30 s per push).
 //   Response: {matchId, turn, action:{type, amount?},
 //     policyProof:{circuitVersion:"v1", proof, public_signals,
@@ -338,6 +341,33 @@ function holdResponse(matchId, turn, reason) {
   };
 }
 
+// Validate a Steal turn response against the v1 protocol schema BEFORE
+// it is submitted: the six required fields (matchId, turn, action,
+// policyProof, agentTimestamp, idempotencyKey) plus the policyProof
+// internals (circuitVersion, Groth16 proof object, non-empty
+// public_signals). Returns null when valid, else the first bad field
+// path — so a malformed body is never submitted; the caller fail-closes
+// to HOLD with the reason instead (practice 19 Nov 2026 failed exactly
+// this way: policyProof undefined).
+function validateStealResponse(body) {
+  if (!body || typeof body !== 'object') return 'body';
+  if (typeof body.matchId !== 'string' || !body.matchId) return 'matchId';
+  if (typeof body.turn !== 'number' || !Number.isFinite(body.turn)) return 'turn';
+  if (!body.action || typeof body.action !== 'object' || typeof body.action.type !== 'string') return 'action';
+  const pp = body.policyProof;
+  if (!pp || typeof pp !== 'object') return 'policyProof';
+  if (typeof pp.circuitVersion !== 'string' || !pp.circuitVersion) return 'policyProof.circuitVersion';
+  const proof = pp.proof;
+  if (!proof || typeof proof !== 'object'
+    || !Array.isArray(proof.pi_a) || !Array.isArray(proof.pi_b) || !Array.isArray(proof.pi_c)) return 'policyProof.proof';
+  if (!Array.isArray(pp.public_signals) || pp.public_signals.length === 0
+    || pp.public_signals.some((s) => typeof s !== 'string')) return 'policyProof.public_signals';
+  if (typeof pp.publicInputsHash !== 'string' || !pp.publicInputsHash) return 'policyProof.publicInputsHash';
+  if (typeof body.agentTimestamp !== 'string' || !body.agentTimestamp) return 'agentTimestamp';
+  if (typeof body.idempotencyKey !== 'string' || !body.idempotencyKey) return 'idempotencyKey';
+  return null;
+}
+
 function isNonNegInt(v) {
   if (typeof v === 'number') return Number.isInteger(v) && v >= 0;
   if (typeof v === 'string') return /^\d+$/.test(v);
@@ -537,11 +567,15 @@ async function handleSteal(envelope) {
     if (prev === undefined) seenNonces.set(nonce, cacheKey);
   }
 
-  // The envelope's frozen commitment must match ours, or no valid proof
-  // can be produced (circuit line 72). Fast paths first, then a
-  // shape-agnostic recursive scan of the whole envelope (the live
-  // platform envelope's commitment was not found at any fixed path in
-  // the 18:42 and 19:05 practice runs). Fail closed to HOLD, no proof.
+  // The envelope's frozen commitment must match ours when the envelope
+  // carries one, or no valid proof can be produced (circuit line 72).
+  // Fast paths first, then a shape-agnostic recursive scan of the whole
+  // envelope. If NO candidate is found anywhere, fall back to our own
+  // registered commitment and prove: the proof is built with COMMITMENT
+  // anyway, and the dashboard holds exactly that commitment (live
+  // practice 19 Nov 2026: three turns, envelope (missing)). Only a
+  // *different* candidate fail-closes to HOLD, no proof — never prove
+  // a policy the platform does not expect.
   const ourHash = '0x' + BigInt(COMMITMENT).toString(16).padStart(64, '0');
   const ourHex = ourHash.slice(2).toLowerCase();
   const envHex = envelopeCommitment(envelope);
@@ -553,24 +587,22 @@ async function handleSteal(envelope) {
   }
   if (!matched) {
     const shown = envHex || (scan && scan.firstCandidate);
-    // Distinguish "absent" from "different" for the next live log
-    // capture: when no candidate was found anywhere in the envelope,
-    // say so explicitly (the [warn] below would only print "(missing)").
     if (!shown) {
-      console.warn('[diag] steal envelope: NO commitment candidate found in envelope');
+      console.warn('[warn] strategyCommitment missing in envelope — falling back to our registered commitment %s', ourHash);
+    } else {
+      console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', shown.slice(0, 18) + '…', ourHash);
+      // Diagnostic: the envelope shape, so a future mismatch can be
+      // diagnosed from live logs (blitz.cloud keeps no log history, and a
+      // failed practice shows no sanitised request). Strings are truncated
+      // to 40 chars; the envelope is the platform's task payload and
+      // contains no secrets (the HMAC signature is a header, not the body).
+      console.warn('[diag] steal envelope keys=[%s] body=%s',
+        Object.keys(envelope).join(','),
+        JSON.stringify(truncateStrings(envelope)));
+      const r = holdResponse(matchId, turn, 'COMMITMENT_MISMATCH');
+      responseCache.set(cacheKey, { status: r.status, body: JSON.stringify(r.body) });
+      return r;
     }
-    console.warn('[warn] strategyCommitment mismatch (envelope %s, ours %s) — HOLD, no proof', shown ? shown.slice(0, 18) + '…' : '(missing)', ourHash);
-    // Diagnostic: the envelope shape, so a future mismatch can be
-    // diagnosed from live logs (blitz.cloud keeps no log history, and a
-    // failed practice shows no sanitised request). Strings are truncated
-    // to 40 chars; the envelope is the platform's task payload and
-    // contains no secrets (the HMAC signature is a header, not the body).
-    console.warn('[diag] steal envelope keys=[%s] body=%s',
-      Object.keys(envelope).join(','),
-      JSON.stringify(truncateStrings(envelope)));
-    const r = holdResponse(matchId, turn, 'COMMITMENT_MISMATCH');
-    responseCache.set(cacheKey, { status: r.status, body: JSON.stringify(r.body) });
-    return r;
   }
 
   // Deadline guard: the platform waits ~30 s per push; turn deadline is 5 min.
@@ -610,6 +642,13 @@ async function handleSteal(envelope) {
       agentTimestamp: new Date().toISOString(),
       idempotencyKey: idempotencyKeyFor(matchId, turn),
     };
+    const badField = validateStealResponse(body);
+    if (badField) {
+      console.error('[steal] response validation failed at %s — NOT submitting, returning HOLD', badField);
+      const r = holdResponse(matchId, turn, 'INVALID_RESPONSE');
+      responseCache.set(cacheKey, { status: r.status, body: JSON.stringify(r.body) });
+      return r;
+    }
     responseCache.set(cacheKey, { status: 200, body: JSON.stringify(body) });
     return { status: 200, body };
   } catch (e) {
@@ -746,4 +785,5 @@ module.exports = {
   envelopeCommitment,
   scanEnvelopeCommitment,
   truncateStrings,
+  validateStealResponse,
 };
